@@ -125,3 +125,87 @@ func (d Decision) String() string {
 type Evaluator interface {
 	Evaluate(req Request) Decision
 }
+
+// Evaluate runs deny-overrides, default-deny over the full policy slice.
+func Evaluate(policies []Policy, req Request) Decision {
+	var (
+		denyMatchID  string
+		allowMatchID string
+		foundDeny    bool
+		foundAllow   bool
+	)
+	for _, p := range policies {
+		if !p.Matches(req) {
+			continue
+		}
+		switch p.Effect {
+		case Deny:
+			if !foundDeny {
+				foundDeny = true
+				denyMatchID = p.ID
+			}
+		case Allow:
+			if !foundAllow {
+				foundAllow = true
+				allowMatchID = p.ID
+			}
+		}
+	}
+	return ResolveDecision(foundDeny, denyMatchID, foundAllow, allowMatchID, len(policies))
+}
+
+// EvaluateIndices runs deny-overrides only over the given candidate positions,
+// avoiding allocation of a new policy slice.
+func EvaluateIndices(policies []Policy, positions []int, req Request) Decision {
+	var (
+		denyMatchID  string
+		allowMatchID string
+		foundDeny    bool
+		foundAllow   bool
+	)
+	for _, idx := range positions {
+		p := policies[idx]
+		if !p.Matches(req) {
+			continue
+		}
+		switch p.Effect {
+		case Deny:
+			if !foundDeny {
+				foundDeny = true
+				denyMatchID = p.ID
+			}
+		case Allow:
+			if !foundAllow {
+				foundAllow = true
+				allowMatchID = p.ID
+			}
+		}
+	}
+	return ResolveDecision(foundDeny, denyMatchID, foundAllow, allowMatchID, len(positions))
+}
+
+func ResolveDecision(foundDeny bool, denyMatchID string, foundAllow bool, allowMatchID string, scanned int) Decision {
+	switch {
+	case foundDeny:
+		return Decision{
+			Allowed:         false,
+			MatchedPolicyID: denyMatchID,
+			Effect:          Deny,
+			PoliciesScanned: scanned,
+		}
+	case foundAllow:
+		return Decision{
+			Allowed:         true,
+			MatchedPolicyID: allowMatchID,
+			Effect:          Allow,
+			PoliciesScanned: scanned,
+		}
+	default:
+		return Decision{
+			Allowed:         false,
+			MatchedPolicyID: "",
+			Effect:          Deny,
+			PoliciesScanned: scanned,
+		}
+	}
+}
