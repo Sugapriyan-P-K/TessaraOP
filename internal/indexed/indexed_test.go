@@ -10,103 +10,106 @@ import (
 )
 
 func TestIndexed_BasicAllow(t *testing.T) {
-	policies := []model.Policy{
-		{ID: "p1", Effect: model.Allow, Conditions: []model.Condition{
-			{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-		}},
-	}
-	e := New(policies)
-	req := model.Request{Attributes: map[string]string{"department": "engineering"}}
-	d := e.Evaluate(req)
+	e := New([]model.Policy{{
+		ID: "p1", TenantID: "t", Effect: model.Allow,
+		Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}}},
+	}})
+	d := e.Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"role": "admin"}})
 	if !d.Allowed || d.MatchedPolicyID != "p1" {
 		t.Fatalf("expected allow via p1, got %s", d)
 	}
 }
 
 func TestIndexed_DenyOverrides(t *testing.T) {
-	policies := []model.Policy{
-		{ID: "allow-eng", Effect: model.Allow, Conditions: []model.Condition{
-			{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-		}},
-		{ID: "deny-critical", Effect: model.Deny, Conditions: []model.Condition{
-			{Attribute: "resource.sensitivity", Operator: model.OpIn, Values: []string{"critical"}},
-		}},
-	}
-	e := New(policies)
-	req := model.Request{Attributes: map[string]string{
-		"department":           "engineering",
-		"resource.sensitivity": "critical",
-	}}
-	d := e.Evaluate(req)
-	if d.Allowed {
-		t.Fatalf("expected deny-overrides, got %s", d)
-	}
-	if d.MatchedPolicyID != "deny-critical" {
-		t.Fatalf("expected deny-critical as matched policy, got %s", d)
+	e := New([]model.Policy{
+		{ID: "allow", TenantID: "t", Effect: model.Allow, Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}}}},
+		{ID: "deny", TenantID: "t", Effect: model.Deny, Conditions: []model.Condition{
+			{Attribute: "sensitivity", Operator: model.OpIn, Values: []string{"critical"}}}},
+	})
+	d := e.Evaluate(model.Request{TenantID: "t", Attributes: map[string]string{
+		"role": "admin", "sensitivity": "critical"}})
+	if d.Allowed || d.MatchedPolicyID != "deny" {
+		t.Fatalf("expected deny to win, got %s", d)
 	}
 }
 
 func TestIndexed_DefaultDeny(t *testing.T) {
-	policies := []model.Policy{
-		{ID: "p1", Effect: model.Allow, Conditions: []model.Condition{
-			{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-		}},
-	}
-	e := New(policies)
-	req := model.Request{Attributes: map[string]string{"department": "sales"}}
-	d := e.Evaluate(req)
-	if d.Allowed {
-		t.Fatalf("expected default-deny for non-matching request, got %s", d)
+	e := New([]model.Policy{{
+		ID: "p1", TenantID: "t", Effect: model.Allow,
+		Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}}},
+	}})
+	if d := e.Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"role": "viewer"}}); d.Allowed {
+		t.Fatalf("expected default-deny, got %s", d)
 	}
 }
 
-func TestIndexed_PoliciesScannedLessThanTotal(t *testing.T) {
-	policies := make([]model.Policy, 100)
+func TestIndexed_ScansFarFewerThanAll(t *testing.T) {
+	policies := make([]model.Policy, 1000)
 	for i := range policies {
-		dept := "other"
-		if i%10 == 0 {
-			dept = "engineering"
+		role := "viewer"
+		if i%100 == 0 {
+			role = "admin"
 		}
 		policies[i] = model.Policy{
-			ID:     "p",
-			Effect: model.Allow,
+			ID: "p", TenantID: "t", Effect: model.Allow,
 			Conditions: []model.Condition{
-				{Attribute: "department", Operator: model.OpEquals, Values: []string{dept}},
-			},
+				{Attribute: "role", Operator: model.OpEquals, Values: []string{role}}},
 		}
 	}
-	e := New(policies)
-	req := model.Request{Attributes: map[string]string{"department": "engineering"}}
-	d := e.Evaluate(req)
-
-	if d.PoliciesScanned >= 100 {
-		t.Fatalf("indexed evaluator should scan fewer than all 100 policies, scanned %d", d.PoliciesScanned)
-	}
+	d := New(policies).Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"role": "admin"}})
 	if d.PoliciesScanned != 10 {
-		t.Fatalf("expected exactly 10 candidates (every 10th policy), got %d", d.PoliciesScanned)
+		t.Fatalf("expected exactly the 10 admin policies to reach validation, got %d",
+			d.PoliciesScanned)
 	}
 }
 
+// TestDifferential_MatchesNaive checks the index in isolation, without the
+// sharding and caching layered on top by the engine. Keeping this separate
+// means a regression can be attributed to the index itself rather than to
+// whichever engine feature was touched most recently.
 func TestDifferential_MatchesNaive(t *testing.T) {
-	for seed := int64(0); seed < 50; seed++ {
-		rng := rand.New(rand.NewSource(seed))
-		policies := genutil.GeneratePolicies(100, rng)
+	for _, alg := range []model.Algorithm{
+		model.DenyOverrides, model.PermitOverrides, model.FirstApplicable,
+	} {
+		t.Run(string(alg), func(t *testing.T) {
+			for seed := int64(0); seed < 30; seed++ {
+				rng := rand.New(rand.NewSource(seed))
+				corpus := genutil.Generate(genutil.Options{
+					Policies: 200, Tenants: 1, Global: 0}, rng)
 
-		naiveEval := naive.New(policies)
-		indexedEval := New(policies)
+				// This evaluator does no sharding, so the corpus is flattened
+				// onto one tenant at tenant-wide scope. Otherwise the naive
+				// oracle would scope-filter while the index would not, and the
+				// two would be answering questions about different policy sets.
+				const tenant = "flat"
+				for i := range corpus.Policies {
+					corpus.Policies[i].TenantID = tenant
+					corpus.Policies[i].Scope = model.TenantWideScope
+				}
 
-		for j := 0; j < 20; j++ {
-			req := genutil.GenerateRequest(rng)
+				ref := naive.NewWith(corpus.Policies, alg)
+				idx := NewWith(corpus.Policies, alg)
 
-			naiveD := naiveEval.Evaluate(req)
-			indexedD := indexedEval.Evaluate(req)
-
-			if naiveD.Allowed != indexedD.Allowed ||
-				naiveD.MatchedPolicyID != indexedD.MatchedPolicyID ||
-				naiveD.Effect != indexedD.Effect {
-				t.Fatalf("seed=%d req=%d: naive=%s indexed=%s",
-					seed, j, naiveD, indexedD)
+				for q := 0; q < 25; q++ {
+					req := corpus.GenerateRequest(rng)
+					req.TenantID = tenant
+					req.Scope = model.TenantWideScope
+					want := ref.Evaluate(req)
+					got := idx.Evaluate(req)
+					if want.Allowed != got.Allowed ||
+						want.Effect != got.Effect ||
+						want.MatchedPolicyID != got.MatchedPolicyID {
+						t.Fatalf("seed=%d q=%d\n naive:   %s\n indexed: %s\n request: %+v",
+							seed, q, want, got, req)
+					}
+				}
 			}
-		}
+		})
 	}
 }

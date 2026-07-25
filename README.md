@@ -1,137 +1,279 @@
 # TessaraOP
 
-A high-throughput ABAC (attribute-based access control) policy evaluation
-engine proving that per-attribute field indexing with bitset intersection
-beats naive linear policy scanning — and that the performance gap grows
-with policy-set size.
+A multi-tenant ABAC / Zero-Trust policy decision engine built to answer
+authorization questions against millions of policies in microseconds.
 
-This mirrors what specialized hardware (TCAM) does for router ACLs and
-firewall rules — multi-dimensional predicate matching against many rules
-simultaneously — reimplemented in software for ABAC/IAM/Zero Trust-style
-access policies.
+A request — *this admin, from 10.4.2.7, with risk score 12, calling
+`/api/v2/admin/users` on `api.admin.acme.com` at 14:30* — is checked against a
+policy corpus two ways: by linear scan, and by the engine. The engine is
+verified against the scan on every test run, so the speed claims and the
+correctness claims rest on the same evidence.
 
-## How it works
+## What a policy looks like
 
-A request like *"can this engineering-department subject read a
-high-sensitivity resource at 2pm?"* gets checked against a policy set
-two ways:
+```
+Policy: acme-prod-admin-console
+  Tenant:   acme          Scope: identity        Priority: 100
+  Effect:   ALLOW
+  Conditions (all AND-ed):
+    subject.role          IN     [admin, security-admin]
+    subject.risk_score    RANGE  [0, 30]
+    subject.mfa_verified  ==     true
+    network.source_ip     CIDR   10.0.0.0/8
+    network.source_ip     !CIDR  203.0.113.0/24
+    resource.domain       SUFFIX admin.acme.com
+    resource.path         PREFIX /api/v2/admin
+    time.hour             RANGE  [9, 17]
+    geo.country           IN     [US, CA]
+  Obligations: require_mfa, audit_log
+```
 
-- **Naive evaluator**: linear scan every policy, check if all conditions
-  match, apply deny-overrides/default-deny. O(N) per request.
-- **Indexed evaluator**: look up per-attribute bitsets, AND them together
-  to narrow to a small candidate set, then run the *exact same* match
-  logic only on survivors.
+Fourteen operators across four families, each needing a different index
+structure — a hash map cannot answer "is 10.4.2.7 inside 10.0.0.0/8".
 
-The benchmark harness proves the indexed version is faster and gets the
-identical answer every time (proven via differential testing, not assumed).
+| Family | Operators | Index structure |
+|---|---|---|
+| Set | `eq` `ne` `in` `nin` `exists` `nexists` | hash map |
+| Numeric | `range` `gt` `lt` | distinct-range table, binary searched |
+| Network | `cidr` `ncidr` | binary radix trie over address bits |
+| Name | `dnssuffix` `prefix` | reversed-label trie / prefix table |
+
+Decisions carry **obligations** (`require_mfa`, `audit_log`, `step_up_auth`) so
+a policy can grant conditionally rather than only allow or deny.
+
+## Deny-overrides, and why that choice is structural
+
+The default is **deny-overrides with default-deny**: any matching deny wins,
+otherwise any matching allow, otherwise denied. `permit-overrides` and
+`first-applicable` are also implemented and selectable per engine.
+
+The security argument for deny-overrides is the familiar one — it fails safe,
+and adding a deny can only ever reduce access. The engineering argument is the
+one that actually shaped this codebase:
+
+> Deny-overrides is **order-independent**, and that is what makes indexing
+> sound. The index yields candidates in whatever order the underlying sets
+> enumerate. If the algorithm were order-sensitive, that arbitrary order would
+> leak into the decision. `first-applicable` is order-sensitive, so it pays for
+> a priority ordering pass and cannot short-circuit.
+
+One consequence is worth stating plainly: when several policies match with the
+winning effect, deny-overrides does not define *which* to credit, and the
+engine reports whichever it reached before stopping. `MatchedPolicyID` is
+therefore *a* justification, not a canonical one. Audit trails needing stable
+attribution should use `first-applicable`, which is fully deterministic
+(priority, then policy ID).
 
 ## Architecture
 
 ```
-Request → [Field Index Lookup] → [Bitset AND] → [Exact validation on survivors] → Decision
-           (hash map per attr)    (word-packed     (same logic naive uses)
-                                   intersect)
+Request
+  │
+  ├─ decision cache ──────────────► hit: ~1.1 µs, verified by full key compare
+  │
+  ├─ global shard      (platform denies: blocklists, kill switches)
+  ├─ tenant-wide shard (customer-wide rules)
+  └─ (tenant, scope) shard
+        │
+        ├─ per-attribute filters ─── hash / radix trie / label trie / range table
+        ├─ order cheapest-first, seed from the most selective
+        ├─ filter the candidate list in place, shrinking as it goes
+        └─ exact validation on survivors ── model.Policy.Matches
 ```
-
-### Package layout
 
 ```
 internal/
-├── model/      Policy, Condition, Request, Decision, shared eval semantics
-├── naive/      O(N) linear-scan baseline evaluator
-├── bitset/     Dense word-packed bitset (Set/Test/And/Or/Xor/Ones)
-├── index/      Per-attribute field indexes built from a policy set
-├── indexed/    Index lookup + bitset AND + final validation evaluator
-├── genutil/    Synthetic policy/request generator for benchmarking
-└── benchmark/  go test -bench harness
+├── model/      types, operator semantics, combining algorithms
+├── naive/      linear-scan oracle
+├── bitset/     hybrid sparse/dense integer sets
+├── matcher/    CIDR trie, domain trie, prefix table, interval table
+├── index/      per-attribute sub-indexes and the intersection
+├── engine/     sharding, algorithm selection, decision cache
+├── genutil/    synthetic multi-tenant corpus generator
+└── benchmark/  layered benchmarks
 ```
 
-## Benchmark results
+## Results
 
-| Scale | Naive (ns/op) | Indexed (ns/op) | Speedup | Candidates | % of total |
-|-------|-------------:|----------------:|--------:|-----------:|-----------:|
-| 1,000 | 30,316 | 5,152 | **5.9x** | 102 | 10.2% |
-| 10,000 | 346,532 | 51,430 | **6.7x** | 985 | 9.9% |
-| 100,000 | 5,277,846 | 1,005,390 | **5.3x** | 10,219 | 10.2% |
+Intel Xeon @ 2.10 GHz, 4 cores, Go 1.24. Corpus: policies spread over tenants
+with a 1/rank skew (one whale, long tail), 8 scopes per tenant, 50 global
+policies, all four operator families in use.
 
-Index build (one-time, at construction): 129µs / 1.6ms / 22ms.
+**Multi-tenant corpus — linear scan vs. engine**
 
-### Honest read of these numbers
+| Corpus | Naive | Engine | Speedup | Validated | Alloc |
+|---|---:|---:|---:|---:|---:|
+| 10,000 | 38.5 µs | 6.4 µs | **6x** | 9 | 0 B |
+| 100,000 | 378 µs | 5.6 µs | **67x** | 0 | 0 B |
+| 1,000,000 | 4.03 ms | 4.9 µs | **816x** | 22 | 0 B |
 
-The candidate-set reduction is a consistent ~10x at every scale — the index
-does its job. But the end-to-end speedup (5.3–6.7x) is smaller and doesn't
-scale linearly with the candidate reduction. Root cause: the dense bitset
-is `O(N/64)` words, so every AND/OR and the final bit-enumeration (`Ones()`)
-costs time proportional to total N, not candidate-set size — regardless of
-how small the surviving set is.
+Engine latency is flat as the corpus grows 100x, because per-request cost
+tracks the shard, not the corpus. Out of a million policies, 22 reach exact
+validation.
 
-This is the direct, measurable cost of choosing a dense bitset over a
-compressed one (RoaringBitmap). A compressed bitmap that's sparse in
-practice would make the AND operations proportional to actual set
-cardinality, pushing end-to-end speedup closer to the raw ~10x candidate
-reduction. This is real signal from profiling, not a modeling assumption.
+**Layers, at 1M policies**
 
-## Correctness guarantees
+| Configuration | Latency | Throughput |
+|---|---:|---:|
+| Engine, single-threaded | 4.9 µs | 204k req/s |
+| Engine, 4 cores | 2.0 µs/op | **513k req/s** |
+| Engine + decision cache (hit) | 1.1–1.5 µs | ~800k req/s |
 
-1. **Shared evaluation semantics.** Both evaluators call the same
-   `Policy.Matches()` / `Condition.Matches()` methods and the same
-   `ResolveDecision()` function in `internal/model`. Semantics cannot
-   silently drift between the two paths.
+The steady-state hot path performs **zero allocations**: scratch buffers are
+pooled per goroutine, and the lazy set union lives in a fixed array rather than
+a slice.
 
-2. **Index is a pre-filter only.** The index stage can only be conservative
-   (over-inclusive), never wrongly exclude a matching policy. A bug in the
-   index costs performance, not correctness, because the final validation
-   pass always re-runs ground-truth matching.
+**Index build (one-time)**
 
-3. **Differential testing.** `TestDifferential_MatchesNaive` runs 50
-   randomized policy sets × 20 requests each (1,000 comparisons) asserting
-   the indexed and naive evaluators produce identical decisions.
+| Corpus | Build | Memory |
+|---|---:|---:|
+| 10,000 | 36 ms | 23 MB |
+| 100,000 | 381 ms | 208 MB |
+| 1,000,000 | 8.3 s | 1.9 GB |
 
-4. **The no-condition property.** A policy with no condition on attribute A
-   must NOT be excluded by A's index. Implemented via
-   `noCondition = universe.Xor(hasCondition)` (complement within known
-   universe). Tested explicitly in
-   `TestCandidates_PolicyWithNoConditionAlwaysSurvives`.
+### Where this does not win
 
-## Evaluation semantics
+Two honest results, both measured rather than assumed.
 
-- **Deny-overrides, default-deny**: an explicit Deny match always wins
-  regardless of scan order; no match at all = denied.
-- Conditions within a policy are implicitly AND-ed.
-- A policy with zero conditions matches everything (catch-all).
-- Range conditions (`OpRange`) are NOT indexed in v1 — only checked in the
-  final validation pass. This is intentional scope.
+**The naive baseline is not really O(N), and that flatters the headline
+number.** Under deny-overrides a linear scan stops at the first matching deny.
+With ~20% deny policies, a match turns up after about 375 policies regardless
+of corpus size. So on a *flat* corpus, naive never does O(N) work:
+
+| Flat corpus | Naive | Indexed (no sharding) |
+|---|---:|---:|
+| 10,000 | 19.2 µs | 256 µs |
+| 100,000 | 17.6 µs | 2.66 ms |
+
+**Indexing alone is a 100x loss here.** The reason is structural: a filter
+must pass every policy that places no condition on the attribute, so the
+smallest available seed set is still a large fraction of the shard. Building
+that seed costs O(shard), while the scan it replaces stops after a few hundred
+policies. In the multi-tenant table above, naive's cost is dominated by
+walking the corpus to skip out-of-scope policies — which is exactly the work
+sharding eliminates.
+
+The conclusion the data supports is not "indexing is fast". It is:
+
+> **Sharding is what buys the microseconds; indexing is what keeps a shard's
+> cost proportional to its survivors.** Neither is sufficient alone, and on a
+> single flat scope this index design is worse than a linear scan.
+
+**The whale shard is still the tail.** Scoping cuts the largest tenant's
+working set from 102,220 to 21,935 policies, and its latency from 1.80 ms to
+168 µs — but that is 34x the average request.
+
+| Corpus | Worst-case shard | In scope | Validated |
+|---|---:|---:|---:|
+| 10,000 | 9.9 µs | 499 | 2 |
+| 100,000 | 24.2 µs | 2,937 | 15 |
+| 1,000,000 | 168 µs | 21,935 | 92 |
+
+A scope holding tens of thousands of policies is where this design runs out,
+and the fix is a different structure rather than a tuning pass — see next
+steps.
+
+## Correctness
+
+The engine is far too intricate to trust by inspection: sharding, four index
+families, negation handling, lazy set unions, a cache, and three combining
+algorithms. Correctness rests on four things instead.
+
+1. **Shared semantics.** Both evaluators route every match through
+   `Condition.Matches` and resolve through the same `Accumulator`. The fast
+   path has no second copy of the rules to drift from.
+
+2. **The index is a pre-filter only.** It may be over-inclusive but never
+   under-inclusive, and survivors always face the real match logic. A bug in
+   an index costs performance, not correctness — a property asserted directly
+   by a randomized test that checks no genuinely matching policy is ever
+   excluded, across every operator family.
+
+3. **Differential testing.** Randomized corpora run through both evaluators
+   under all three algorithms, asserting the same decision. Where the credited
+   policy is not canonically defined, the test verifies it names a policy that
+   is in scope, actually matches, and carries the winning effect — rather than
+   asserting a false determinism.
+
+4. **Adversarial and concurrent cases.** Missing attributes, unknown tenants,
+   empty requests, lookalike domains; plus eight goroutines against one engine
+   under `-race`.
+
+Two security properties have dedicated tests:
+
+- **DNS label alignment.** `strings.HasSuffix("evilacme.com", "acme.com")` is
+  true, so a naive suffix check hands a lookalike domain the authorization
+  scoped to the real one. Both the trie and the validation path match on label
+  boundaries.
+- **Cache hits are verified, never assumed.** Every hit compares the full
+  request against the stored key. A hash collision serving one subject another
+  subject's decision would be an authorization bug, so the hash only selects a
+  slot. A test drives 3,000 distinct requests through an 8-entry cache to force
+  collisions.
+
+Absent attributes **fail closed**: every operator except `nexists` rejects a
+request that lacks the attribute, negations included. `role != admin` does not
+quietly pass for a request carrying no role.
 
 ## Running
 
 ```bash
 go build ./...
-go test ./... -v                                                    # 32 tests
-go test ./internal/benchmark/... -bench=. -benchtime=2s -benchmem   # benchmarks
+go test ./... -race
+go test ./internal/benchmark/... -bench=. -benchtime=1s -benchmem
 ```
 
-## Design decisions
+```bash
+# Walk a hand-written policy set covering every operator
+go run ./cmd/tessaraop -demo
 
-- **Dense bitset over RoaringBitmap**: a custom `[]uint64` bitset avoids
-  external dependencies while proving the core thesis. Swapping in
-  RoaringBitmap is the most concrete next optimization — the benchmark
-  data already shows exactly why (dense bitset O(N/64) overhead is the
-  bottleneck, not the candidate-set reduction).
+# One million policies over ten thousand tenants
+go run ./cmd/tessaraop -n 1000000 -tenants 10000 -requests 10
 
-- **Shared vocabulary in synthetic data**: the generator uses 10
-  departments × 4 sensitivity tiers × 5 actions (not random unique
-  strings) because real IAM rule sets have many policies sharing the same
-  attribute values.
+# With the decision cache, under first-applicable
+go run ./cmd/tessaraop -n 1000000 -cache 8192 -alg first-applicable
 
-- **EvaluateIndices over slice copy**: the indexed evaluator iterates by
-  position index into the original policy slice rather than copying matched
-  policies into a new slice — a measured allocation fix (eliminates
-  per-request slice allocation scaling with candidate count).
+# Type requests and watch both evaluators
+go run ./cmd/tessaraop -n 100000 -interactive
+```
 
-## Explicitly out of scope (v1)
+## Design notes
 
-- Range/interval indexing (segment tree for time-of-day conditions)
-- BDD/MTBDD evaluation stage
-- Tuple space search
-- Incremental index updates
-- Compressed bitmaps (RoaringBitmap)
+- **Hybrid sparse/dense sets.** A purely dense bitset makes every operation
+  O(N/64) regardless of how few elements survive. Sets here carry a sorted
+  `[]uint32` when sparse and a bitmap when dense, so intersection cost tracks
+  the candidate count.
+
+- **Negation needs no complement.** For a negated operator,
+  `notParticipating ∪ (participating \ rejected)` is just the universe minus
+  the rejected set — so negations are cheap post-filters, not set differences
+  computed per request.
+
+- **Lazy set union in a fixed array.** Nested CIDR prefixes and DNS suffixes
+  produce multi-set unions. Materializing them would allocate per filter per
+  request; a lazy union in an 8-element array removed the last of the hot-path
+  allocations.
+
+- **Lazily built sub-indexes.** An attribute almost always uses one operator
+  family, so building all twelve structures per attribute wasted most of them.
+  Deferring construction cut build allocations from 55.8M to 26.4M.
+
+- **Realistic corpus generation.** Shared vocabularies rather than unique
+  per-policy values (unique values would give every hash bucket one member and
+  flatter the index), and skewed tenant sizes rather than uniform, so the whale
+  case cannot hide.
+
+## Next steps
+
+1. **Tuple space search** — group policies by which attributes they constrain,
+   then hash the request's values for each group. This sidesteps the
+   non-participant inflation that makes the flat and whale-shard cases slow,
+   and is the direct answer to the two limitations above.
+2. **Incremental index updates** — adding a policy currently rebuilds its
+   shard. Sharding already bounds the blast radius; per-shard rebuild on write
+   is the next increment.
+3. **Build-time memory** — 1.9 GB at a million policies is heavy for a
+   structure that is read-only afterwards; sub-index construction can stream
+   rather than buffer.
+4. **BDD/MTBDD compilation** — would also yield policy conflict and
+   redundancy detection as a byproduct.

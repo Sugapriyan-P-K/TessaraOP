@@ -7,10 +7,10 @@ import (
 )
 
 func TestEmptyPolicySet_DefaultDeny(t *testing.T) {
-	e := New([]model.Policy{})
-	d := e.Evaluate(model.Request{Attributes: map[string]string{"department": "eng"}})
+	e := New(nil)
+	d := e.Evaluate(model.Request{TenantID: "t"})
 	if d.Allowed {
-		t.Fatalf("expected default-deny on empty policy set, got %s", d)
+		t.Fatalf("expected default-deny on an empty corpus, got %s", d)
 	}
 	if d.PoliciesScanned != 0 {
 		t.Fatalf("expected 0 policies scanned, got %d", d.PoliciesScanned)
@@ -18,177 +18,116 @@ func TestEmptyPolicySet_DefaultDeny(t *testing.T) {
 }
 
 func TestSingleAllowMatch(t *testing.T) {
-	policies := []model.Policy{
-		{
-			ID:     "p1",
-			Effect: model.Allow,
-			Conditions: []model.Condition{
-				{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-			},
-		},
-	}
-	e := New(policies)
+	e := New([]model.Policy{{
+		ID: "p1", TenantID: "t", Effect: model.Allow,
+		Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}}},
+	}})
 
-	req := model.Request{Attributes: map[string]string{"department": "engineering"}}
-	d := e.Evaluate(req)
-	if !d.Allowed || d.MatchedPolicyID != "p1" {
-		t.Fatalf("expected allow via p1, got %s", d)
+	hit := e.Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"role": "admin"}})
+	if !hit.Allowed || hit.MatchedPolicyID != "p1" {
+		t.Fatalf("expected allow via p1, got %s", hit)
 	}
 
-	req2 := model.Request{Attributes: map[string]string{"department": "sales"}}
-	d2 := e.Evaluate(req2)
-	if d2.Allowed {
-		t.Fatalf("expected default-deny for non-matching department, got %s", d2)
+	miss := e.Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"role": "viewer"}})
+	if miss.Allowed {
+		t.Fatalf("expected default-deny for a non-matching role, got %s", miss)
 	}
 }
 
-func TestDenyOverridesAllow(t *testing.T) {
-	// p1 (Allow) would match on department alone, but p2 (Deny) also
-	// matches on resource sensitivity — deny-overrides means the
-	// request must be denied even though p1 matched too, and even
-	// though p1 appears first in the slice.
+func TestDenyOverridesRegardlessOfOrder(t *testing.T) {
 	policies := []model.Policy{
-		{
-			ID:     "p1",
-			Effect: model.Allow,
-			Conditions: []model.Condition{
-				{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-			},
-		},
-		{
-			ID:     "p2",
-			Effect: model.Deny,
-			Conditions: []model.Condition{
-				{Attribute: "resource.sensitivity", Operator: model.OpIn, Values: []string{"critical"}},
-			},
-		},
+		{ID: "allow", TenantID: "t", Effect: model.Allow, Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}}}},
+		{ID: "deny", TenantID: "t", Effect: model.Deny, Conditions: []model.Condition{
+			{Attribute: "sensitivity", Operator: model.OpIn, Values: []string{"critical"}}}},
 	}
-	e := New(policies)
+	req := model.Request{TenantID: "t", Attributes: map[string]string{
+		"role": "admin", "sensitivity": "critical"}}
 
-	req := model.Request{
-		Attributes: map[string]string{
-			"department":           "engineering",
-			"resource.sensitivity": "critical",
-		},
-	}
-	d := e.Evaluate(req)
-	if d.Allowed {
-		t.Fatalf("expected deny-overrides to win, got %s", d)
-	}
-	if d.MatchedPolicyID != "p2" {
-		t.Fatalf("expected p2 (deny) to be the matched policy, got %s", d)
-	}
-	if d.PoliciesScanned != len(policies) {
-		t.Fatalf("expected full scan of %d policies, got %d", len(policies), d.PoliciesScanned)
+	forward := New(policies).Evaluate(req)
+	reversed := New([]model.Policy{policies[1], policies[0]}).Evaluate(req)
+
+	for _, d := range []model.Decision{forward, reversed} {
+		if d.Allowed || d.MatchedPolicyID != "deny" {
+			t.Fatalf("deny must win irrespective of slice order, got %s", d)
+		}
 	}
 }
 
-func TestRangeCondition_TimeOfDay(t *testing.T) {
+func TestTenantScoping(t *testing.T) {
+	// The naive evaluator has to apply the same tenant scoping the sharded
+	// engine does, or the differential tests would be comparing different
+	// policy sets and every mismatch would be noise.
 	policies := []model.Policy{
-		{
-			ID:     "business-hours-only",
-			Effect: model.Allow,
-			Conditions: []model.Condition{
-				{Attribute: "time.hour", Operator: model.OpRange, Min: 9, Max: 17},
-			},
-		},
+		{ID: "a", TenantID: "tenant-a", Effect: model.Allow},
+		{ID: "b", TenantID: "tenant-b", Effect: model.Deny},
+		{ID: "g", TenantID: model.GlobalTenant, Effect: model.Allow},
 	}
 	e := New(policies)
 
-	inHours := model.Request{Numeric: map[string]float64{"time.hour": 14.5}}
-	if d := e.Evaluate(inHours); !d.Allowed {
-		t.Fatalf("expected allow within business hours, got %s", d)
+	d := e.Evaluate(model.Request{TenantID: "tenant-a"})
+	if !d.Allowed {
+		t.Fatalf("tenant-a should not see tenant-b's deny, got %s", d)
 	}
+	if d.PoliciesScanned != 2 {
+		t.Fatalf("expected to scan tenant-a plus global (2), got %d", d.PoliciesScanned)
+	}
+}
 
-	afterHours := model.Request{Numeric: map[string]float64{"time.hour": 22}}
-	if d := e.Evaluate(afterHours); d.Allowed {
-		t.Fatalf("expected deny outside business hours, got %s", d)
+func TestGlobalPolicyAppliesToEveryTenant(t *testing.T) {
+	e := New([]model.Policy{
+		{ID: "kill-switch", TenantID: model.GlobalTenant, Effect: model.Deny},
+		{ID: "grant", TenantID: "tenant-a", Effect: model.Allow},
+	})
+	if d := e.Evaluate(model.Request{TenantID: "tenant-a"}); d.Allowed {
+		t.Fatalf("a global deny must override a tenant grant, got %s", d)
 	}
 }
 
 func TestMultiConditionPolicy_AllMustMatch(t *testing.T) {
-	policies := []model.Policy{
-		{
-			ID:     "eng-high-sensitivity",
-			Effect: model.Allow,
-			Conditions: []model.Condition{
-				{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-				{Attribute: "resource.sensitivity", Operator: model.OpIn, Values: []string{"high", "critical"}},
-			},
-		},
-	}
-	e := New(policies)
+	e := New([]model.Policy{{
+		ID: "p", TenantID: "t", Effect: model.Allow,
+		Conditions: []model.Condition{
+			{Attribute: "role", Operator: model.OpEquals, Values: []string{"admin"}},
+			{Attribute: "sensitivity", Operator: model.OpIn, Values: []string{"high", "critical"}}},
+	}})
 
-	// Only one of two conditions satisfied -> should NOT match.
-	partial := model.Request{
-		Attributes: map[string]string{
-			"department":           "engineering",
-			"resource.sensitivity": "low",
-		},
-	}
-	if d := e.Evaluate(partial); d.Allowed {
-		t.Fatalf("expected deny when only one condition matches, got %s", d)
+	partial := e.Evaluate(model.Request{TenantID: "t", Attributes: map[string]string{
+		"role": "admin", "sensitivity": "low"}})
+	if partial.Allowed {
+		t.Fatalf("expected deny when only one condition holds, got %s", partial)
 	}
 
-	// Both conditions satisfied -> should match.
-	full := model.Request{
-		Attributes: map[string]string{
-			"department":           "engineering",
-			"resource.sensitivity": "high",
-		},
-	}
-	if d := e.Evaluate(full); !d.Allowed {
-		t.Fatalf("expected allow when all conditions match, got %s", d)
+	full := e.Evaluate(model.Request{TenantID: "t", Attributes: map[string]string{
+		"role": "admin", "sensitivity": "high"}})
+	if !full.Allowed {
+		t.Fatalf("expected allow when all conditions hold, got %s", full)
 	}
 }
 
-func TestMissingAttribute_NeverMatches(t *testing.T) {
-	policies := []model.Policy{
-		{
-			ID:     "p1",
-			Effect: model.Allow,
-			Conditions: []model.Condition{
-				{Attribute: "department", Operator: model.OpEquals, Values: []string{"engineering"}},
-			},
-		},
-	}
-	e := New(policies)
-
-	// Request simply doesn't carry the attribute the policy cares about.
-	req := model.Request{Attributes: map[string]string{}}
-	if d := e.Evaluate(req); d.Allowed {
-		t.Fatalf("expected deny when attribute is absent, got %s", d)
+func TestConditionlessPolicyMatchesEverything(t *testing.T) {
+	e := New([]model.Policy{{ID: "catch-all", TenantID: "t", Effect: model.Deny}})
+	if d := e.Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"anything": "goes"}}); d.Allowed {
+		t.Fatalf("a conditionless deny must match, got %s", d)
 	}
 }
 
-func TestConditionlessPolicy_MatchesEverything(t *testing.T) {
-	policies := []model.Policy{
-		{ID: "catch-all-deny", Effect: model.Deny, Conditions: []model.Condition{}},
-	}
-	e := New(policies)
-	d := e.Evaluate(model.Request{Attributes: map[string]string{"anything": "goes"}})
-	if d.Allowed {
-		t.Fatalf("expected conditionless deny policy to match and deny, got %s", d)
-	}
-}
-
-func TestPoliciesScanned_AlwaysFullScan(t *testing.T) {
-	// Naive evaluator must scan every policy every time, even when an
-	// Allow match is found early — because a later Deny could still
-	// override it. This test locks that invariant in.
-	policies := make([]model.Policy, 0, 50)
-	for i := 0; i < 50; i++ {
-		policies = append(policies, model.Policy{
-			ID:     "p",
-			Effect: model.Allow,
+func TestPoliciesScannedReflectsInScopeSet(t *testing.T) {
+	policies := make([]model.Policy, 50)
+	for i := range policies {
+		policies[i] = model.Policy{
+			ID: "p", TenantID: "t", Effect: model.Allow,
 			Conditions: []model.Condition{
-				{Attribute: "x", Operator: model.OpEquals, Values: []string{"never-matches"}},
-			},
-		})
+				{Attribute: "x", Operator: model.OpEquals, Values: []string{"never"}}},
+		}
 	}
-	e := New(policies)
-	d := e.Evaluate(model.Request{Attributes: map[string]string{"x": "never-matches"}})
+	d := New(policies).Evaluate(model.Request{TenantID: "t",
+		Attributes: map[string]string{"x": "other"}})
 	if d.PoliciesScanned != 50 {
-		t.Fatalf("expected PoliciesScanned == 50, got %d", d.PoliciesScanned)
+		t.Fatalf("naive must scan every in-scope policy, got %d", d.PoliciesScanned)
 	}
 }

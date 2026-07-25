@@ -1,3 +1,11 @@
+// Package indexed is a single-shard indexed evaluator.
+//
+// It applies indexing without sharding, which makes it the control in the
+// benchmarks: comparing naive to indexed isolates what the index alone buys,
+// and comparing indexed to the sharded engine isolates what partitioning
+// buys on top. Keeping the two effects separable is what lets the results
+// table attribute the speedup honestly instead of reporting one blended
+// number.
 package indexed
 
 import (
@@ -5,19 +13,33 @@ import (
 	"github.com/suga/tessaraop/internal/model"
 )
 
+// Evaluator indexes one flat policy set with no tenant partitioning.
 type Evaluator struct {
-	policies []model.Policy
-	index    *index.IndexSet
+	shard     *index.Shard
+	scratch   *index.Scratch
+	Algorithm model.Algorithm
 }
 
+// New builds an indexed evaluator over the policies using deny-overrides.
 func New(policies []model.Policy) *Evaluator {
+	return NewWith(policies, model.DenyOverrides)
+}
+
+// NewWith builds an indexed evaluator with an explicit combining algorithm.
+func NewWith(policies []model.Policy, alg model.Algorithm) *Evaluator {
 	return &Evaluator{
-		policies: policies,
-		index:    index.Build(policies),
+		shard:     index.BuildShard(policies),
+		scratch:   index.NewScratch(),
+		Algorithm: alg,
 	}
 }
 
+// Evaluate narrows the policy set via the index, then applies exact match
+// logic to the survivors.
+//
+// Not safe for concurrent use: the scratch buffer is owned by this evaluator.
+// The sharded engine pools scratch per goroutine and is the concurrent path.
 func (e *Evaluator) Evaluate(req model.Request) model.Decision {
-	candidates := e.index.Candidates(req)
-	return model.EvaluateIndices(e.policies, candidates, req)
+	cands := e.shard.Candidates(req, e.scratch)
+	return model.EvaluateIndices(e.shard.Policies, cands, req, e.Algorithm)
 }
