@@ -13,6 +13,12 @@
 //
 // Flat and sharded runs are kept separate so each comparison holds everything
 // but one variable constant.
+//
+// The "validated" metric counts rules, not policies. A rule is the atomic
+// indexed unit, so it is the number that tracks per-request cost; the policy
+// count would understate the work by whatever the average rules-per-policy
+// happens to be. The corpus sizes below are still stated in policies, since that
+// is the unit a customer counts their own policy set in.
 package benchmark
 
 import (
@@ -116,7 +122,7 @@ func BenchmarkIndexedFlat(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				scanned = e.Evaluate(reqs[i&63]).PoliciesScanned
+				scanned = e.Evaluate(reqs[i&63]).RulesScanned
 			}
 			b.ReportMetric(float64(scanned), "validated")
 		})
@@ -156,7 +162,7 @@ func BenchmarkEngine(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				scanned = e.Evaluate(reqs[i&63]).PoliciesScanned
+				scanned = e.Evaluate(reqs[i&63]).RulesScanned
 			}
 			b.ReportMetric(float64(scanned), "validated")
 		})
@@ -238,7 +244,7 @@ func BenchmarkWorstCaseShard(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				scanned = e.Evaluate(reqs[i&63]).PoliciesScanned
+				scanned = e.Evaluate(reqs[i&63]).RulesScanned
 			}
 			b.ReportMetric(float64(scanned), "validated")
 			b.ReportMetric(float64(worst), "in-scope")

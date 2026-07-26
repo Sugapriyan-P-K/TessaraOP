@@ -42,7 +42,8 @@ type Engine struct {
 	cache *Cache
 
 	scratch sync.Pool
-	total   int
+	total   int // policies
+	rules   int // rules across every shard: the indexed universe size
 	tenants int
 }
 
@@ -109,6 +110,15 @@ func New(policies []model.Policy, cfg Config) *Engine {
 		e.scoped[k] = index.BuildShard(ps)
 	}
 	e.tenants = len(tenantSeen)
+	if e.global != nil {
+		e.rules += e.global.Size()
+	}
+	for _, s := range e.tenantWide {
+		e.rules += s.Size()
+	}
+	for _, s := range e.scoped {
+		e.rules += s.Size()
+	}
 
 	if cfg.CacheSize > 0 {
 		e.cache = NewCache(cfg.CacheSize)
@@ -119,6 +129,10 @@ func New(policies []model.Policy, cfg Config) *Engine {
 
 // TotalPolicies reports the corpus size across every shard.
 func (e *Engine) TotalPolicies() int { return e.total }
+
+// TotalRules reports how many rules the corpus holds. This, not the policy
+// count, is what the index universe is sized to and what per-shard cost tracks.
+func (e *Engine) TotalRules() int { return e.rules }
 
 // TenantCount reports how many distinct tenants hold policies.
 func (e *Engine) TenantCount() int { return e.tenants }
@@ -132,9 +146,9 @@ func (e *Engine) ShardCount() int {
 	return n
 }
 
-// InScope reports how many policies a request can reach: the global shard,
-// its tenant-wide shard, and its own scope's shard. This is the number that
-// governs per-request cost, as opposed to the corpus total.
+// InScope reports how many rules a request can reach: the global shard, its
+// tenant-wide shard, and its own scope's shard. This is the number that governs
+// per-request cost, as opposed to the corpus total.
 func (e *Engine) InScope(tenantID, scope string) int {
 	n := 0
 	if e.global != nil {
@@ -161,47 +175,35 @@ func (e *Engine) Evaluate(req model.Request) model.Decision {
 	sc := e.scratch.Get().(*index.Scratch)
 	defer e.scratch.Put(sc)
 
-	acc := model.NewAccumulator(e.alg)
-	scanned := 0
+	var acc model.Accumulator
+	acc.Reset(e.alg)
+	policies, rules := 0, 0
 
 	// Global first: it is the smallest shard and the most likely to end
 	// evaluation outright under deny-overrides, so paying for it up front is
 	// usually cheaper than reaching it last.
 	if e.global != nil {
-		scanned += evalShard(e.global, req, acc, sc)
+		p, r := e.global.Evaluate(req, sc, &acc)
+		policies, rules = policies+p, rules+r
 	}
 	if !acc.CanShortCircuit() {
 		if s, ok := e.tenantWide[req.TenantID]; ok {
-			scanned += evalShard(s, req, acc, sc)
+			p, r := s.Evaluate(req, sc, &acc)
+			policies, rules = policies+p, rules+r
 		}
 	}
 	if !acc.CanShortCircuit() {
 		if s, ok := e.scoped[shardKey{req.TenantID, req.Scope}]; ok {
-			scanned += evalShard(s, req, acc, sc)
+			p, r := s.Evaluate(req, sc, &acc)
+			policies, rules = policies+p, rules+r
 		}
 	}
 
-	acc.SetScanned(scanned)
+	acc.SetScanned(policies, rules)
 	d := acc.Resolve()
 
 	if e.cache != nil {
 		e.cache.Put(req, d)
 	}
 	return d
-}
-
-// evalShard narrows the shard to candidates and validates them, feeding
-// matches into the shared accumulator. It returns how many policies reached
-// validation, which is the metric proving the index is doing work.
-func evalShard(s *index.Shard, req model.Request, acc *model.Accumulator, sc *index.Scratch) int {
-	cands := s.Candidates(req, sc)
-	for _, idx := range cands {
-		if s.Policies[idx].Matches(req) {
-			acc.Consider(&s.Policies[idx])
-			if acc.CanShortCircuit() {
-				break
-			}
-		}
-	}
-	return len(cands)
 }

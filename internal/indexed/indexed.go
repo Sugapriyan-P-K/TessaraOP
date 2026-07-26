@@ -34,12 +34,18 @@ func NewWith(policies []model.Policy, alg model.Algorithm) *Evaluator {
 	}
 }
 
-// Evaluate narrows the policy set via the index, then applies exact match
-// logic to the survivors.
+// Evaluate narrows the rule set via the index, then applies exact match logic
+// to the survivors under both combining tiers.
 //
 // Not safe for concurrent use: the scratch buffer is owned by this evaluator.
 // The sharded engine pools scratch per goroutine and is the concurrent path.
 func (e *Evaluator) Evaluate(req model.Request) model.Decision {
-	cands := e.shard.Candidates(req, e.scratch)
-	return model.EvaluateIndices(e.shard.Policies, cands, req, e.Algorithm)
+	var acc model.Accumulator
+	acc.Reset(e.Algorithm)
+	policies, rules := e.shard.Evaluate(req, e.scratch, &acc)
+	acc.SetScanned(policies, rules)
+	return acc.Resolve()
 }
+
+// TotalRules reports the size of the indexed universe.
+func (e *Evaluator) TotalRules() int { return e.shard.Size() }
