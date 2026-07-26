@@ -83,10 +83,11 @@ var (
 	}
 
 	tlsVersions = []string{"SSLv3", "TLS1.0", "TLS1.1", "TLS1.2", "TLS1.3"}
-	// tls.version_num encodes the same versions numerically, so a floor
-	// ("at least 1.2") is one comparison rather than an enumerated set that
-	// needs editing whenever a new version ships.
-	tlsVersionNums = []float64{30, 10, 11, 12, 13}
+	// tls.version_num encodes the same versions on a scale monotonic in protocol
+	// age, so a floor ("at least 1.2") is one comparison rather than an
+	// enumerated set that needs editing whenever a new version ships. SSLv3 is 3,
+	// not 30, so that it sorts below TLS 1.0 rather than above TLS 1.3.
+	tlsVersionNums = []float64{3, 10, 11, 12, 13}
 	proxyTypes     = []string{"none", "tor", "vpn", "proxy", "hosting"}
 
 	// Body size ceilings policies commonly enforce, in bytes.

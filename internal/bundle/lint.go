@@ -338,11 +338,15 @@ func lintLeafOperands(n *Node, path string, op model.Operator) []Diagnostic {
 		if len(n.Values) == 0 {
 			add(Error, "operator %q needs at least one value", op)
 		}
-		for i, v := range n.Values {
-			if v == "" {
-				add(Warning, "value %d is empty; %q against an empty string is almost "+
-					"certainly not intended", i, op)
-			}
+		// An empty string as the *only* value is almost always an editing
+		// mistake. Among several it is often deliberate and correct: a NULL TCP
+		// scan really does present no flags, so matching
+		// `transport.tcp_flags in ["fin,syn", "", "fin,psh,urg"]` is how the
+		// three classic invalid-flag scans are expressed. So this warns only on
+		// the unambiguous case.
+		if len(n.Values) == 1 && n.Values[0] == "" {
+			add(Warning, "the only value is an empty string; %q against \"\" matches "+
+				"just the present-and-empty case, which is rarely the intent", op)
 		}
 		if op == model.OpSuffix || op == model.OpNotSuffix {
 			for _, v := range n.Values {

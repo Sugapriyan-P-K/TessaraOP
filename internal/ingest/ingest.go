@@ -60,6 +60,10 @@ type Builder struct {
 
 	// bodyLimit caps how much of a request body FromBody will read.
 	bodyLimit int64
+
+	// cookies is the set of cookie names whose values may become attributes.
+	// Nil means none, which is the default; see WithCookies.
+	cookies map[string]bool
 }
 
 // DefaultBodyLimit bounds payload inspection. Bodies are only read when a caller
@@ -88,6 +92,31 @@ func New(tenantID, scope string) *Builder {
 func (b *Builder) WithBodyLimit(n int64) *Builder {
 	if n > 0 {
 		b.bodyLimit = n
+	}
+	return b
+}
+
+// WithCookies allowlists the cookie names whose values may become attributes.
+//
+// No cookie is populated unless named here, and that default is the point. A
+// session cookie is a credential; copying every cookie into the attribute map
+// would put it in the decision cache, in whatever an integration logs, and in any
+// audit record — the same leak this package refuses for the raw Cookie header,
+// arriving through a different door.
+//
+// So the caller names the cookies their policies actually reference. Those are
+// almost never the secret ones: a locale, a feature flag, a consent marker. If a
+// policy genuinely needs to test a session cookie, prefer resolving it upstream
+// and passing the result through FromSubject or session.valid, so the engine sees
+// a verdict rather than the credential.
+func (b *Builder) WithCookies(names ...string) *Builder {
+	if b.cookies == nil {
+		b.cookies = make(map[string]bool, len(names))
+	}
+	for _, n := range names {
+		if n != "" {
+			b.cookies[n] = true
+		}
 	}
 	return b
 }
@@ -310,8 +339,13 @@ func (b *Builder) FromHTTPRequest(r *http.Request) *Builder {
 		}
 	}
 
-	for _, c := range r.Cookies() {
-		b.Set(attr.Cookie(c.Name), c.Value)
+	// Cookies, but only those explicitly allowlisted. See WithCookies.
+	if len(b.cookies) > 0 {
+		for _, c := range r.Cookies() {
+			if b.cookies[c.Name] {
+				b.Set(attr.Cookie(c.Name), c.Value)
+			}
+		}
 	}
 
 	// WebSocket upgrade attempts.
@@ -469,10 +503,17 @@ func tlsVersionName(v uint16) string {
 
 // tlsVersionNumber encodes a version for numeric comparison, so a policy can say
 // "at least 1.2" once instead of enumerating every acceptable version and needing
-// an edit when a new one ships. SSLv3 maps to 30 so it sorts below every TLS
-// version rather than above 1.3.
+// an edit when a new one ships.
+//
+// The scale must be monotonic in protocol age, and that is the whole subtlety.
+// Encoding SSLv3 as its version number, 30, would place it above TLS 1.3's 13, so
+// a `tls.version_num >= 12` floor would accept SSLv3 — precisely the connection
+// the rule exists to reject. So SSLv3 is 3, and an unrecognized version is 0,
+// which fails every floor a policy can express.
 func tlsVersionNumber(v uint16) float64 {
 	switch v {
+	case tls.VersionSSL30:
+		return 3
 	case tls.VersionTLS10:
 		return 10
 	case tls.VersionTLS11:
@@ -482,7 +523,7 @@ func tlsVersionNumber(v uint16) float64 {
 	case tls.VersionTLS13:
 		return 13
 	}
-	return 30
+	return 0
 }
 
 // --- Identity ---------------------------------------------------------------

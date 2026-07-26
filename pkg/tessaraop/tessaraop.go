@@ -456,6 +456,10 @@ func ExportBundle(policies []Policy, w io.Writer) error {
 // HasErrors reports whether any diagnostic blocks loading.
 func HasErrors(diags []Diagnostic) bool { return bundle.HasErrors(diags) }
 
+// Errors returns only the blocking diagnostics, for a caller that wants to count
+// or report them separately from warnings.
+func Errors(diags []Diagnostic) []Diagnostic { return bundle.Errors(diags) }
+
 // FormatDiagnostics renders diagnostics one per line, errors first, for a log
 // line or a CI annotation.
 func FormatDiagnostics(diags []Diagnostic) string {

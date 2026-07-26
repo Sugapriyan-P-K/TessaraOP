@@ -1,0 +1,352 @@
+{
+  "version": 1,
+  "policies": [
+    {
+      "id": "global-baseline",
+      "tenant": "__global__",
+      "priority": 1000,
+      "rules": [
+        {
+          "id": "block-listed-source",
+          "effect": "DENY",
+          "when": {
+            "attr": "network.source_ip",
+            "op": "cidr",
+            "prefixes": [
+              "203.0.113.0/24"
+            ]
+          },
+          "obligations": [
+            "notify_soc"
+          ]
+        },
+        {
+          "id": "block-high-risk",
+          "effect": "DENY",
+          "when": {
+            "attr": "subject.risk_score",
+            "op": "gt",
+            "min": 90
+          },
+          "obligations": [
+            "step_up_auth"
+          ]
+        },
+        {
+          "id": "block-weak-tls",
+          "effect": "DENY",
+          "when": {
+            "attr": "tls.version_num",
+            "op": "lt",
+            "max": 12
+          }
+        },
+        {
+          "id": "block-scanners",
+          "effect": "DENY",
+          "when": {
+            "any": [
+              {
+                "attr": "http.user_agent",
+                "op": "contains",
+                "values": [
+                  "sqlmap",
+                  "nikto",
+                  "nmap"
+                ]
+              },
+              {
+                "attr": "http.query",
+                "op": "regex",
+                "values": [
+                  "(?i)union\\s+all?\\s*select"
+                ]
+              }
+            ]
+          },
+          "obligations": [
+            "notify_soc",
+            "audit_log"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acme-admin-console",
+      "tenant": "acme",
+      "scope": "identity",
+      "priority": 100,
+      "rules": [
+        {
+          "id": "grant-admin-console",
+          "effect": "ALLOW",
+          "priority": 100,
+          "when": {
+            "all": [
+              {
+                "any": [
+                  {
+                    "attr": "subject.role",
+                    "op": "eq",
+                    "values": [
+                      "admin"
+                    ]
+                  },
+                  {
+                    "attr": "subject.role",
+                    "op": "eq",
+                    "values": [
+                      "security-admin"
+                    ]
+                  }
+                ]
+              },
+              {
+                "not": {
+                  "attr": "subject.groups",
+                  "op": "contains",
+                  "values": [
+                    "contractor"
+                  ]
+                }
+              },
+              {
+                "attr": "subject.risk_score",
+                "op": "range",
+                "min": 0,
+                "max": 30
+              },
+              {
+                "attr": "subject.mfa_verified",
+                "op": "eq",
+                "values": [
+                  "true"
+                ]
+              },
+              {
+                "attr": "network.source_ip",
+                "op": "cidr",
+                "prefixes": [
+                  "10.0.0.0/8"
+                ]
+              },
+              {
+                "attr": "resource.domain",
+                "op": "dnssuffix",
+                "values": [
+                  "admin.acme.com"
+                ]
+              },
+              {
+                "attr": "resource.path",
+                "op": "prefix",
+                "values": [
+                  "/api/v2/admin"
+                ]
+              },
+              {
+                "attr": "time.hour",
+                "op": "range",
+                "min": 9,
+                "max": 17
+              }
+            ]
+          },
+          "obligations": [
+            "require_mfa",
+            "audit_log"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acme-readonly",
+      "tenant": "acme",
+      "priority": 10,
+      "rules": [
+        {
+          "id": "grant-read",
+          "effect": "ALLOW",
+          "priority": 10,
+          "when": {
+            "all": [
+              {
+                "attr": "subject.role",
+                "op": "nin",
+                "values": [
+                  "service-account"
+                ]
+              },
+              {
+                "attr": "action",
+                "op": "eq",
+                "values": [
+                  "read"
+                ]
+              },
+              {
+                "attr": "resource.domain",
+                "op": "dnssuffix",
+                "values": [
+                  "acme.com"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "acme-break-glass",
+      "tenant": "acme",
+      "priority": 500,
+      "rule_algorithm": "first-applicable",
+      "rules": [
+        {
+          "id": "deny-critical-delete",
+          "effect": "DENY",
+          "priority": 10,
+          "when": {
+            "all": [
+              {
+                "attr": "action",
+                "op": "eq",
+                "values": [
+                  "delete"
+                ]
+              },
+              {
+                "attr": "resource.sensitivity",
+                "op": "in",
+                "values": [
+                  "critical"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "except-approved-break-glass",
+          "effect": "ALLOW",
+          "priority": 100,
+          "when": {
+            "all": [
+              {
+                "attr": "action",
+                "op": "eq",
+                "values": [
+                  "delete"
+                ]
+              },
+              {
+                "attr": "resource.sensitivity",
+                "op": "in",
+                "values": [
+                  "critical"
+                ]
+              },
+              {
+                "attr": "subject.claim.break_glass_ticket",
+                "op": "exists"
+              },
+              {
+                "attr": "subject.role",
+                "op": "eq",
+                "values": [
+                  "security-admin"
+                ]
+              }
+            ]
+          },
+          "obligations": [
+            "audit_log",
+            "notify_soc"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acme-perimeter",
+      "tenant": "acme",
+      "scope": "network",
+      "priority": 800,
+      "rules": [
+        {
+          "id": "deny-admin-ports-off-corp",
+          "effect": "DENY",
+          "priority": 800,
+          "when": {
+            "all": [
+              {
+                "attr": "transport.dest_port",
+                "op": "num_in",
+                "numbers": [
+                  22,
+                  3389,
+                  5985
+                ]
+              },
+              {
+                "not": {
+                  "attr": "network.source_ip",
+                  "op": "cidr",
+                  "prefixes": [
+                    "10.0.0.0/8"
+                  ]
+                }
+              }
+            ]
+          },
+          "obligations": [
+            "notify_soc"
+          ]
+        },
+        {
+          "id": "deny-invalid-flags",
+          "effect": "DENY",
+          "priority": 800,
+          "when": {
+            "attr": "transport.tcp_flags",
+            "op": "in",
+            "values": [
+              "fin,syn",
+              "",
+              "fin,psh,urg"
+            ]
+          }
+        },
+        {
+          "id": "deny-executable-upload",
+          "effect": "DENY",
+          "priority": 800,
+          "when": {
+            "all": [
+              {
+                "attr": "http.method",
+                "op": "in",
+                "values": [
+                  "POST",
+                  "PUT"
+                ]
+              },
+              {
+                "attr": "payload.file_ext",
+                "op": "suffix",
+                "values": [
+                  ".exe",
+                  ".bat",
+                  ".php",
+                  ".sh",
+                  ".jsp"
+                ]
+              }
+            ]
+          },
+          "obligations": [
+            "audit_log"
+          ]
+        }
+      ]
+    }
+  ]
+}

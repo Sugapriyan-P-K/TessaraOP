@@ -1,9 +1,11 @@
 // Command tessaraop exercises the policy engine from the terminal.
 //
-//	-demo         walk a hand-written policy set covering every operator family
-//	-attrs        print the attribute registry an integration must populate
-//	-interactive  type request attributes and see decisions
-//	(default)     generate a corpus and compare naive against the engine
+//	-demo          walk a hand-written policy set covering every operator family
+//	-attrs         print the attribute registry an integration must populate
+//	-lint FILE     validate a policy bundle; non-zero exit if it has errors
+//	-export        write the demo policy set as a starter bundle on stdout
+//	-interactive   type request attributes and see decisions
+//	(default)      generate a corpus and compare naive against the engine
 package main
 
 import (
@@ -19,10 +21,12 @@ import (
 	"time"
 
 	"github.com/suga/tessaraop/internal/attr"
+	"github.com/suga/tessaraop/internal/bundle"
 	"github.com/suga/tessaraop/internal/engine"
 	"github.com/suga/tessaraop/internal/genutil"
 	"github.com/suga/tessaraop/internal/model"
 	"github.com/suga/tessaraop/internal/naive"
+	"github.com/suga/tessaraop/pkg/tessaraop"
 )
 
 func main() {
@@ -39,11 +43,26 @@ func main() {
 		demo        = flag.Bool("demo", false, "run the hand-written policy walkthrough")
 		attrs       = flag.Bool("attrs", false, "print the attribute registry and exit")
 		interactive = flag.Bool("interactive", false, "enter interactive request mode")
+		lintPath    = flag.String("lint", "", "validate a policy bundle and exit")
+		strictAttrs = flag.Bool("strict-attributes", false,
+			"with -lint, reject attributes outside the registry")
+		export = flag.Bool("export", false,
+			"write the demo policy set as a starter bundle on stdout and exit")
 	)
 	flag.Parse()
 
 	if *attrs {
 		printRegistry()
+		return
+	}
+	if *lintPath != "" {
+		os.Exit(runLint(*lintPath, *strictAttrs))
+	}
+	if *export {
+		if err := tessaraop.ExportBundle(demoPolicies(), os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "export: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if *demo {
@@ -76,6 +95,47 @@ func main() {
 		return
 	}
 	runBench(eng, corpus, rng, *requests, *compare, cfg)
+}
+
+// runLint validates a bundle and reports findings, returning the process exit
+// code. It is meant for CI: a policy change should fail the pipeline, not the
+// request path.
+func runLint(path string, strict bool) int {
+	diags, err := tessaraop.LintBundleFile(path, tessaraop.LintOptions{StrictAttributes: strict})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot read %s: %v\n", path, err)
+		return 1
+	}
+
+	errs := tessaraop.Errors(diags)
+	for _, d := range diags {
+		fmt.Printf("%s\n", d)
+	}
+
+	// Report what the index will be able to prune on. A policy set written mostly
+	// as disjunctions is correct but slow, and that is worth knowing before it
+	// ships rather than after a latency alert.
+	if b, rerr := bundle.ReadFile(path); rerr == nil {
+		s := b.Summarize()
+		fmt.Printf("\n%s: %d policies, %d rules, %d conditions across %d tenants\n",
+			path, s.Policies, s.Rules, s.Conditions, s.Tenants)
+		if s.Conditions > 0 {
+			fmt.Printf("  indexable:        %d of %d conditions on the AND-spine (%.1f%%)\n",
+				s.IndexableConds, s.Conditions,
+				100*float64(s.IndexableConds)/float64(s.Conditions))
+		}
+		if s.Rules > 0 {
+			fmt.Printf("  rules with OR/NOT: %d (%.1f%%) — validated in full when their shard is reached\n",
+				s.RulesWithOrNot, 100*float64(s.RulesWithOrNot)/float64(s.Rules))
+		}
+		fmt.Printf("  attributes used:  %d\n", len(s.Attributes))
+	}
+
+	fmt.Printf("\n%d error(s), %d warning(s)\n", len(errs), len(diags)-len(errs))
+	if len(errs) > 0 {
+		return 1
+	}
+	return 0
 }
 
 // printRegistry lists every attribute an ingestion adapter is expected to
@@ -538,23 +598,27 @@ func ruleAlg(p *model.Policy) model.Algorithm {
 func demoPolicies() []model.Policy {
 	return []model.Policy{
 		{
+			// Every rule here is a DENY under deny-overrides, so rule priorities
+			// would be ignored. They are left at zero rather than set to
+			// plausible-looking values, because a priority that does nothing reads
+			// as if it orders the rules — the linter flags exactly that.
 			ID: "global-baseline", TenantID: model.GlobalTenant, Priority: 1000,
 			Rules: []model.Rule{
 				{
-					ID: "block-listed-source", Effect: model.Deny, Priority: 1000,
+					ID: "block-listed-source", Effect: model.Deny,
 					When: model.Cond(model.Condition{
 						Attribute: attr.SourceIP, Operator: model.OpCIDR,
 						Prefixes: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}}),
 					Obligations: []string{"notify_soc"},
 				},
 				{
-					ID: "block-high-risk", Effect: model.Deny, Priority: 999,
+					ID: "block-high-risk", Effect: model.Deny,
 					When: model.Cond(model.Condition{
 						Attribute: attr.RiskScore, Operator: model.OpGreaterThan, Min: 90}),
 					Obligations: []string{"step_up_auth"},
 				},
 				{
-					ID: "block-weak-tls", Effect: model.Deny, Priority: 999,
+					ID: "block-weak-tls", Effect: model.Deny,
 					When: model.Cond(model.Condition{
 						Attribute: attr.TLSVersionNo, Operator: model.OpLessThan, Max: 12}),
 				},
@@ -562,7 +626,7 @@ func demoPolicies() []model.Policy {
 					// Scanner and injection signatures. Neither is indexable, so
 					// both are resolved by validation on every request reaching
 					// the global shard — which is small, by design.
-					ID: "block-scanners", Effect: model.Deny, Priority: 1000,
+					ID: "block-scanners", Effect: model.Deny,
 					When: model.Or(
 						model.Cond(model.Condition{
 							Attribute: attr.UserAgent, Operator: model.OpContains,

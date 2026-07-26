@@ -197,7 +197,7 @@ var Catalog = []Attribute{
 	n("http.uri_length", LayerHTTP, "Length of the full request URI in bytes."),
 	dyn("http.header.", KindString, LayerHTTP, "Any request header by lowercased name, e.g. http.header.x-forwarded-for."),
 	dyn("http.query.", KindString, LayerHTTP, "Any query parameter by name, e.g. http.query.id. First value wins."),
-	dyn("http.cookie.", KindString, LayerHTTP, "Any cookie by name, e.g. http.cookie.session."),
+	dyn("http.cookie.", KindString, LayerHTTP, "A cookie by name, e.g. http.cookie.locale. The ingest adapter populates only cookies an integrator allowlists, since cookie values are frequently credentials."),
 
 	// -- Payload content and signature results --
 	s("payload.body", LayerPayload, "Decoded body, for regex and DLP scanning. Populate only when inspection is enabled."),
@@ -214,7 +214,7 @@ var Catalog = []Attribute{
 
 	// -- TLS handshake and certificates --
 	s("tls.version", LayerTLS, "Negotiated version string: SSLv3, TLS1.0, TLS1.1, TLS1.2, TLS1.3."),
-	n("tls.version_num", LayerTLS, "Negotiated version as a number: 3.0, 1.0, 1.1, 1.2, 1.3 -> 30, 10, 11, 12, 13."),
+	n("tls.version_num", LayerTLS, "Negotiated version on a monotonic scale: SSLv3 -> 3, TLS 1.0-1.3 -> 10, 11, 12, 13, unknown -> 0. Ordered by age so a floor like >=12 rejects everything older."),
 	s("tls.cipher_suite", LayerTLS, "IANA cipher suite name, e.g. TLS_AES_128_GCM_SHA256."),
 	s("tls.sni", LayerTLS, "Server Name Indication from the handshake, lowercased."),
 	s("tls.alpn", LayerTLS, "Negotiated ALPN protocol, e.g. h2, http/1.1."),

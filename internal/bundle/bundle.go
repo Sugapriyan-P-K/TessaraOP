@@ -50,6 +50,7 @@
 package bundle
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -181,10 +182,71 @@ func (n *Node) Kind() NodeKind {
 	return kind
 }
 
+// MarshalJSON writes exactly the one form this node takes.
+//
+// The struct tags alone cannot do this. With `omitempty`, an empty "all" — which
+// means "match everything", the catch-all rule — serializes to {} and reloads as
+// a node with no form at all, which the linter then rejects. Without
+// `omitempty`, every leaf sprouts "all": null. So the form is selected here and
+// an empty combinator is written as an explicit [].
+func (n *Node) MarshalJSON() ([]byte, error) {
+	switch n.Kind() {
+	case NodeAll:
+		return json.Marshal(struct {
+			All []*Node `json:"all"`
+		}{nonNilNodes(n.All)})
+
+	case NodeAny:
+		return json.Marshal(struct {
+			Any []*Node `json:"any"`
+		}{nonNilNodes(n.Any)})
+
+	case NodeNot:
+		return json.Marshal(struct {
+			Not *Node `json:"not"`
+		}{n.Not})
+
+	case NodeLeaf:
+		return json.Marshal(leafWire{
+			Attr: n.Attr, Op: n.Op,
+			Values: n.Values, Min: n.Min, Max: n.Max,
+			Numbers: n.Numbers, Prefixes: n.Prefixes,
+		})
+	}
+
+	// An invalid node is written as {} rather than raising an error: Write must
+	// not fail on an in-memory tree, and the linter reports the shape properly
+	// with a path the author can act on.
+	return []byte("{}"), nil
+}
+
+// leafWire is the serialized form of a leaf. It is a separate type rather than an
+// alias of Node so that marshalling it cannot recurse back into MarshalJSON.
+type leafWire struct {
+	Attr     string    `json:"attr"`
+	Op       string    `json:"op"`
+	Values   []string  `json:"values,omitempty"`
+	Min      *float64  `json:"min,omitempty"`
+	Max      *float64  `json:"max,omitempty"`
+	Numbers  []float64 `json:"numbers,omitempty"`
+	Prefixes []string  `json:"prefixes,omitempty"`
+}
+
+func nonNilNodes(in []*Node) []*Node {
+	if in == nil {
+		return []*Node{}
+	}
+	return in
+}
+
 // Read parses a bundle from r without validating it. Use Lint, or Compile, to
 // find problems; Read only reports malformed JSON.
+//
+// Unknown fields are rejected. A typo'd key would otherwise be silently ignored,
+// and "polices" instead of "policies" yields an empty bundle that denies every
+// request — an outage presented as a successful load.
 func Read(r io.Reader) (*Bundle, error) {
-	dec := json.NewDecoder(r)
+	dec := json.NewDecoder(skipBOM(r))
 	dec.DisallowUnknownFields()
 
 	var b Bundle
@@ -195,6 +257,23 @@ func Read(r io.Reader) (*Bundle, error) {
 		b.Version = FormatVersion
 	}
 	return &b, nil
+}
+
+// skipBOM discards a leading UTF-8 byte-order mark.
+//
+// JSON has no BOM in its grammar, so encoding/json rejects one with "invalid
+// character 'ï'" — an error that says nothing about the actual problem. Plenty of
+// Windows editors and shell redirections emit a BOM by default, so a policy
+// author's very first bundle can arrive with one. Failing on it would be
+// technically defensible and a genuinely bad onboarding experience, so it is
+// simply skipped.
+func skipBOM(r io.Reader) io.Reader {
+	br := bufio.NewReader(r)
+	if prefix, err := br.Peek(3); err == nil &&
+		prefix[0] == 0xEF && prefix[1] == 0xBB && prefix[2] == 0xBF {
+		_, _ = br.Discard(3)
+	}
+	return br
 }
 
 // ReadFile parses a bundle from a path.
