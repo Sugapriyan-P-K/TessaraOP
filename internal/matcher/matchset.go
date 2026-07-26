@@ -105,6 +105,19 @@ func (m *MatchSet) EstimatedCardinality() int { return m.est }
 // IsEmpty reports whether the union holds nothing.
 func (m *MatchSet) IsEmpty() bool { return m.count() == 0 || m.est == 0 }
 
+// OrWords writes the union into dst as a bitmap, accumulating rather than
+// clearing. It is how the word-parallel intersection path consumes a filter:
+// materializing the union as a member list first is precisely the cost that path
+// exists to avoid on a large shard.
+func (m *MatchSet) OrWords(dst []uint64) {
+	for k := 0; k < m.n; k++ {
+		m.inline[k].OrWords(dst)
+	}
+	for _, s := range m.overflow {
+		s.OrWords(dst)
+	}
+}
+
 // AppendMembers appends the deduplicated union to dst. The engine calls this
 // exactly once per request, on the most selective MatchSet only.
 func (m *MatchSet) AppendMembers(dst []int) []int {

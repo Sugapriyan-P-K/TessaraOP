@@ -153,6 +153,35 @@ func (s *Set) AppendMembers(dst []int) []int {
 // tests; the hot path uses AppendMembers with a reused buffer.
 func (s *Set) Members() []int { return s.AppendMembers(make([]int, 0, s.card)) }
 
+// WordCount reports how many 64-bit words a bitmap over [0, n) needs. The index
+// layer sizes its word-parallel scratch buffers with it.
+func WordCount(n int) int { return (n + 63) / 64 }
+
+// OrWords sets, in dst, every bit this set holds. dst must hold at least
+// WordCount(s.Universe()) words and is not cleared first, so successive calls
+// accumulate a union.
+//
+// This is the bridge to the word-parallel intersection path. It exists because
+// the alternative — exposing the backing array — would let a caller mutate a set
+// that shards share across every request, and because a sparse set has no
+// backing array to expose. Both representations can write themselves into a
+// caller-owned buffer, and the buffer is what gets AND-ed.
+func (s *Set) OrWords(dst []uint64) {
+	if s.dense == nil {
+		for _, v := range s.sparse {
+			dst[v/64] |= 1 << (uint(v) % 64)
+		}
+		return
+	}
+	n := len(s.dense)
+	if n > len(dst) {
+		n = len(dst)
+	}
+	for i := 0; i < n; i++ {
+		dst[i] |= s.dense[i]
+	}
+}
+
 // Or returns the union. Used at build time to fold multiple value postings
 // into one set (e.g. an `in [a,b,c]` condition).
 func (s *Set) Or(other *Set) *Set {

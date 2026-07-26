@@ -56,6 +56,7 @@ package index
 
 import (
 	"math"
+	"math/bits"
 	"sort"
 
 	"github.com/suga/tessaraop/internal/bitset"
@@ -577,6 +578,10 @@ type Scratch struct {
 	filters []filter
 	cands   []int
 	rules   []int
+
+	// Word-parallel intersection buffers, grown on demand and reused.
+	acc []uint64
+	tmp []uint64
 }
 
 // NewScratch returns a scratch buffer sized for the expected candidate count.
@@ -588,6 +593,28 @@ func NewScratch() *Scratch {
 	}
 }
 
+// words returns a zeroed slice of nw words from dst, growing it if needed.
+func words(dst []uint64, nw int) []uint64 {
+	if cap(dst) < nw {
+		return make([]uint64, nw)
+	}
+	dst = dst[:nw]
+	for i := range dst {
+		dst[i] = 0
+	}
+	return dst
+}
+
+// wordParallelDivisor sets the seed size at which the word-parallel intersection
+// overtakes per-element filtering: word-parallel is chosen once the seed exceeds
+// s.n / wordParallelDivisor.
+//
+// The two costs are seed × filters of O(1)-ish membership probes against
+// filters × n/64 of word operations. They cross near n/64, and the divisor is 32
+// rather than 64 to bias toward per-element filtering, which has the better
+// constant factor and does not touch a word per 64 rules that survived nothing.
+const wordParallelDivisor = 32
+
 // Candidates returns the rule positions in this shard that survive index
 // filtering. The returned slice aliases sc and is valid only until the next call
 // with the same Scratch. Positions are ascending, which the two-tier walk in
@@ -596,8 +623,41 @@ func (s *Shard) Candidates(req model.Request, sc *Scratch) []int {
 	if s.n == 0 {
 		return nil
 	}
-	sc.filters = sc.filters[:0]
+	best := s.collect(req, sc)
 
+	// Two intersection strategies, because one of them falls apart at each end of
+	// the range.
+	//
+	// Per-element filtering materializes the most selective posting list and
+	// probes the rest, so its cost tracks the surviving candidate count. That is
+	// exactly right on a well-partitioned corpus, where a request reaches a few
+	// hundred rules and the seed is small.
+	//
+	// It collapses on a large *flat* shard — one tenant, no scoping. There the
+	// seed is drawn from a filter whose non-participant complement is itself
+	// enormous, so the engine materializes tens of thousands of ints and probes
+	// each against every filter. Measured on a 200k-rule flat shard that came to
+	// 5ms per request and 10KB of allocation, against 200µs for a plain linear
+	// scan: the index was 25x slower than the baseline it exists to beat.
+	//
+	// Above the threshold the intersection runs as a bitmap AND over words
+	// instead. Cost becomes O(filters × n/64) with no allocation and no
+	// per-candidate probe, which is what makes a single-tenant deployment
+	// viable rather than a cliff.
+	seed := s.n
+	if best >= 0 {
+		seed = sc.filters[best].est
+	}
+	if seed > s.n/wordParallelDivisor {
+		return s.intersectWordParallel(sc, best)
+	}
+	return s.intersectPerElement(sc, best)
+}
+
+// collect builds and orders this request's filters, returning the index of the
+// filter to seed from, or -1 if none can enumerate.
+func (s *Shard) collect(req model.Request, sc *Scratch) int {
+	sc.filters = sc.filters[:0]
 	for _, name := range s.names {
 		s.collectFilters(name, s.attrs[name], req, sc)
 	}
@@ -620,14 +680,17 @@ func (s *Shard) Candidates(req model.Request, sc *Scratch) []int {
 		sc.filters[j+1] = f
 	}
 
-	best := -1
 	for i := range sc.filters {
 		if sc.filters[i].kind == filterPositive {
-			best = i
-			break
+			return i
 		}
 	}
+	return -1
+}
 
+// intersectPerElement materializes the seed filter and probes the survivors
+// against the rest. Best when the seed is small.
+func (s *Shard) intersectPerElement(sc *Scratch, best int) []int {
 	sc.cands = sc.cands[:0]
 	if best == -1 {
 		// No enumerable filter: every rule is a candidate. Happens when the
@@ -639,12 +702,12 @@ func (s *Shard) Candidates(req model.Request, sc *Scratch) []int {
 
 	// Filter in place against every remaining filter, shrinking as we go.
 	//
-	// Every filter is applied rather than bailing out below some candidate
-	// count. A filter pass over k candidates is k Contains probes, which is
-	// cheaper than letting those k rules reach exact validation and run their
-	// full condition trees — so stopping early would trade a cheap probe for
-	// expensive validation, and make pruning depend on the arbitrary order
-	// filters happen to sit in.
+	// Every filter is applied rather than bailing out below some candidate count.
+	// A filter pass over k candidates is k Contains probes, which is cheaper than
+	// letting those k rules reach exact validation and run their full condition
+	// trees — so stopping early would trade a cheap probe for expensive
+	// validation, and make pruning depend on the arbitrary order filters happen
+	// to sit in.
 	for i := range sc.filters {
 		if i == best {
 			continue
@@ -661,6 +724,55 @@ func (s *Shard) Candidates(req model.Request, sc *Scratch) []int {
 			}
 		}
 		sc.cands = sc.cands[:w]
+	}
+	return sc.cands
+}
+
+// intersectWordParallel AND-s the filters together as bitmaps, then enumerates
+// what survives. Best when the seed is a large fraction of the shard.
+func (s *Shard) intersectWordParallel(sc *Scratch, best int) []int {
+	nw := bitset.WordCount(s.n)
+	sc.acc = words(sc.acc, nw)
+
+	if best == -1 {
+		s.all.OrWords(sc.acc)
+	} else {
+		sc.filters[best].pass.OrWords(sc.acc)
+	}
+
+	for i := range sc.filters {
+		if i == best {
+			continue
+		}
+		sc.tmp = words(sc.tmp, nw)
+		f := sc.filters[i]
+
+		var any uint64
+		if f.kind == filterNegative {
+			f.reject.OrWords(sc.tmp)
+			for w := range sc.acc {
+				sc.acc[w] &^= sc.tmp[w]
+				any |= sc.acc[w]
+			}
+		} else {
+			f.pass.OrWords(sc.tmp)
+			for w := range sc.acc {
+				sc.acc[w] &= sc.tmp[w]
+				any |= sc.acc[w]
+			}
+		}
+		if any == 0 {
+			// Nothing survives; further filters cannot revive a rule.
+			return sc.cands[:0]
+		}
+	}
+
+	sc.cands = sc.cands[:0]
+	for w, word := range sc.acc {
+		for word != 0 {
+			sc.cands = append(sc.cands, w*64+bits.TrailingZeros64(word))
+			word &= word - 1
+		}
 	}
 	return sc.cands
 }
