@@ -98,6 +98,17 @@ type attrIndex struct {
 	negValues map[string]*bitset.Set
 	negPart   *bitset.Set
 
+	// Multi-valued set family (has_any, has_all): element -> rules wanting it.
+	// Separate from posValues because the request side is read differently — the
+	// attribute value is split into elements and their postings unioned, rather
+	// than looked up whole.
+	setValues map[string]*bitset.Set
+	setPart   *bitset.Set
+	setNot    *bitset.Set
+
+	// Multi-valued set family, negated (has_none): element -> rules rejecting it.
+	setNegValues map[string]*bitset.Set
+
 	// Existence.
 	existsSet    *bitset.Set // rules requiring the attribute present
 	notExistsSet *bitset.Set // rules requiring it absent
@@ -152,6 +163,11 @@ type attrBuilder struct {
 	posPart   *bitset.Builder
 	negValues map[string]*bitset.Builder
 	negPart   *bitset.Builder
+
+	setValues    map[string]*bitset.Builder
+	setPart      *bitset.Builder
+	setNegValues map[string]*bitset.Builder
+
 	exists    *bitset.Builder
 	notExists *bitset.Builder
 
@@ -312,6 +328,9 @@ func BuildShard(policies []model.Policy) *Shard {
 			posPart:      buildOrEmpty(b.posPart, n),
 			negValues:    freezeValues(b.negValues),
 			negPart:      buildOrEmpty(b.negPart, n),
+			setValues:    freezeValues(b.setValues),
+			setPart:      buildOrEmpty(b.setPart, n),
+			setNegValues: freezeValues(b.setNegValues),
 			existsSet:    buildOrEmpty(b.exists, n),
 			notExistsSet: buildOrEmpty(b.notExists, n),
 			cidr:         b.cidr,
@@ -336,6 +355,9 @@ func BuildShard(policies []model.Policy) *Shard {
 		// set built and never consulted.
 		if ai.posPart.Cardinality() > 0 {
 			ai.posNot = ai.posPart.Complement()
+		}
+		if ai.setPart.Cardinality() > 0 {
+			ai.setNot = ai.setPart.Complement()
 		}
 		if ai.cidrPart.Cardinality() > 0 {
 			ai.cidrNot = ai.cidrPart.Complement()
@@ -415,6 +437,27 @@ func indexCondition(get func(string) *attrBuilder, c *model.Condition, pos, n in
 		b.bs(&b.requiresPresent).Add(pos)
 		for _, v := range c.Values {
 			b.valueBuilder(&b.negValues, v).Add(pos)
+		}
+
+	// -- Multi-valued set family --
+	//
+	// has_all is indexed identically to has_any, which is over-inclusive and
+	// therefore safe: a rule requiring {a, b} is registered under both a and b,
+	// so a request carrying only a still reaches validation, where the exact
+	// subset test rejects it. Indexing the conjunction precisely would need an
+	// intersection at query time, and being over-inclusive is the contract every
+	// other filter here already honours.
+	case model.OpHasAny, model.OpHasAll:
+		b.bs(&b.setPart).Add(pos)
+		b.bs(&b.requiresPresent).Add(pos)
+		for _, v := range c.Values {
+			b.valueBuilder(&b.setValues, v).Add(pos)
+		}
+
+	case model.OpHasNone:
+		b.bs(&b.requiresPresent).Add(pos)
+		for _, v := range c.Values {
+			b.valueBuilder(&b.setNegValues, v).Add(pos)
 		}
 
 	// -- Presence --
@@ -829,6 +872,38 @@ func (s *Shard) collectFilters(name string, ai *attrIndex, req model.Request, sc
 		// Negated set family: reject rules excluding this exact value.
 		if set, ok := ai.negValues[sv]; ok {
 			sc.pushNegative(matcher.Single(set), s.n)
+		}
+
+		// Multi-valued set family. The request value is a delimited set, so it
+		// is split and the postings for each element unioned — the mirror of the
+		// single-valued lookup above. This is what keeps role and group checks
+		// indexable once a hierarchy expands one role into a closure of several;
+		// matching a joined string with `contains` would be both unindexable and
+		// wrong (it would accept "read" for a principal holding only
+		// "readwrite").
+		if ai.setPart.Cardinality() > 0 {
+			ms := matcher.Single(ai.setNot)
+			model.ForEachSetMember(sv, func(elem string) bool {
+				if set, ok := ai.setValues[elem]; ok {
+					ms = ms.Union(set)
+				}
+				return true
+			})
+			sc.push(filterPositive, ms)
+		}
+		// Negated multi-valued set family: reject rules forbidding any element
+		// the request actually carries.
+		if len(ai.setNegValues) > 0 {
+			var rejected matcher.MatchSet
+			model.ForEachSetMember(sv, func(elem string) bool {
+				if set, ok := ai.setNegValues[elem]; ok {
+					rejected = rejected.Union(set)
+				}
+				return true
+			})
+			if !rejected.IsEmpty() {
+				sc.pushNegative(rejected, s.n)
+			}
 		}
 		// Domain suffix, label-aligned.
 		if ai.domainPart.Cardinality() > 0 {

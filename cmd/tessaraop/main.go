@@ -656,8 +656,11 @@ func demoPolicies() []model.Policy {
 					),
 					// A negation: contractors are excluded however they are
 					// labelled. Also off the spine.
+					// has_any, not contains: subject.groups is a comma-delimited
+					// set, and a substring test would also exclude a principal
+					// in "subcontractor" or "contractor-liaison".
 					model.Not(model.Cond(model.Condition{
-						Attribute: "subject.groups", Operator: model.OpContains,
+						Attribute: "subject.groups", Operator: model.OpHasAny,
 						Values: []string{"contractor"}})),
 					// The rest is the AND-spine, and every one of these is indexed.
 					model.Cond(model.Condition{

@@ -70,6 +70,23 @@ const (
 	OpDNSSuffix    Operator = "dnssuffix"  // host is, or is under, any domain in Values
 	OpNotDNSSuffix Operator = "ndnssuffix" // host is under none of Values
 
+	// -- Multi-valued set family --
+	//
+	// These read an attribute whose value is a comma-delimited *set* — the
+	// convention the registry documents for subject.roles, subject.groups,
+	// token.scopes and transport.tcp_flags — and test membership of whole
+	// elements.
+	//
+	// They exist because OpContains is wrong for this and wrong in the dangerous
+	// direction. A principal holding only "readwrite" satisfies
+	// `subject.roles contains "read"`, because that is a substring test. For a
+	// role check that is a privilege escalation. These operators split on the
+	// delimiter and compare complete elements, so "read" matches "read" and
+	// never "readwrite".
+	OpHasAny  Operator = "has_any"  // the set shares at least one element with Values
+	OpHasAll  Operator = "has_all"  // the set contains every element of Values
+	OpHasNone Operator = "has_none" // the set shares no element with Values
+
 	// -- Presence family — read whichever map carries the attribute. --
 
 	OpExists    Operator = "exists"  // the attribute is present
@@ -114,7 +131,8 @@ func (op Operator) Family() Family {
 	case OpEquals, OpNotEquals, OpIn, OpNotIn,
 		OpContains, OpNotContains, OpPrefix, OpNotPrefix,
 		OpSuffix, OpNotSuffix, OpRegex, OpNotRegex,
-		OpDNSSuffix, OpNotDNSSuffix:
+		OpDNSSuffix, OpNotDNSSuffix,
+		OpHasAny, OpHasAll, OpHasNone:
 		return FamilyString
 	case OpRange, OpNotRange, OpGreaterThan, OpGreaterEq,
 		OpLessThan, OpLessEq, OpNumEquals, OpNumNotEq,
@@ -136,10 +154,76 @@ func (op Operator) Negated() bool {
 	switch op {
 	case OpNotEquals, OpNotIn, OpNotContains, OpNotPrefix, OpNotSuffix,
 		OpNotRegex, OpNotDNSSuffix, OpNotExists, OpNotRange, OpNumNotEq,
-		OpNumNotIn, OpNotCIDR:
+		OpNumNotIn, OpNotCIDR, OpHasNone:
 		return true
 	}
 	return false
+}
+
+// SetDelimiter separates elements of a multi-valued string attribute. The
+// registry documents this convention for every attribute that carries a set.
+const SetDelimiter = ','
+
+// ForEachSetMember calls fn for each element of a delimited multi-valued
+// attribute, stopping early if fn returns false.
+//
+// It takes a callback rather than returning a slice because it runs on the
+// evaluation path: splitting into a []string would allocate once per condition
+// per request, and the whole hot path is otherwise allocation-free. Substrings
+// share the value's backing array, so this allocates nothing.
+//
+// Surrounding whitespace is trimmed and empty elements are skipped, so
+// "admin, editor" and "admin,editor" mean the same thing and a trailing comma is
+// harmless.
+func ForEachSetMember(value string, fn func(string) bool) {
+	for len(value) > 0 {
+		var elem string
+		if i := strings.IndexByte(value, SetDelimiter); i >= 0 {
+			elem, value = value[:i], value[i+1:]
+		} else {
+			elem, value = value, ""
+		}
+		if elem = strings.TrimSpace(elem); elem == "" {
+			continue
+		}
+		if !fn(elem) {
+			return
+		}
+	}
+}
+
+// setHasAny reports whether the delimited set shares an element with want.
+func setHasAny(value string, want []string) bool {
+	found := false
+	ForEachSetMember(value, func(elem string) bool {
+		if containsString(want, elem) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// setHasAll reports whether the delimited set contains every element of want.
+func setHasAll(value string, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for _, w := range want {
+		present := false
+		ForEachSetMember(value, func(elem string) bool {
+			if elem == w {
+				present = true
+				return false
+			}
+			return true
+		})
+		if !present {
+			return false
+		}
+	}
+	return true
 }
 
 // AllOperators lists every operator the engine implements, in catalog order.
@@ -150,6 +234,7 @@ var AllOperators = []Operator{
 	OpContains, OpNotContains, OpPrefix, OpNotPrefix,
 	OpSuffix, OpNotSuffix, OpRegex, OpNotRegex,
 	OpDNSSuffix, OpNotDNSSuffix,
+	OpHasAny, OpHasAll, OpHasNone,
 	OpExists, OpNotExists,
 	OpRange, OpNotRange, OpGreaterThan, OpGreaterEq,
 	OpLessThan, OpLessEq, OpNumEquals, OpNumNotEq,
@@ -252,6 +337,13 @@ func (c *Condition) matchString(val string) bool {
 		return c.anyRegex(val)
 	case OpNotRegex:
 		return !c.anyRegex(val)
+
+	case OpHasAny:
+		return setHasAny(val, c.Values)
+	case OpHasAll:
+		return setHasAll(val, c.Values)
+	case OpHasNone:
+		return !setHasAny(val, c.Values)
 	}
 	return false
 }

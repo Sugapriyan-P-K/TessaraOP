@@ -52,6 +52,7 @@ import (
 	"github.com/suga/tessaraop/internal/attr"
 	"github.com/suga/tessaraop/internal/bundle"
 	"github.com/suga/tessaraop/internal/engine"
+	"github.com/suga/tessaraop/internal/hierarchy"
 	"github.com/suga/tessaraop/internal/model"
 )
 
@@ -134,6 +135,15 @@ const (
 	OpNumNotIn     = model.OpNumNotIn
 	OpCIDR         = model.OpCIDR
 	OpNotCIDR      = model.OpNotCIDR
+
+	// Multi-valued set operators. Use these — never OpContains — on an attribute
+	// the registry documents as a comma-delimited set (subject.roles,
+	// subject.groups, token.scopes, resource.ancestors, transport.tcp_flags).
+	// OpContains is a substring test, so a principal holding only "readwrite"
+	// would satisfy `contains "read"`.
+	OpHasAny  = model.OpHasAny
+	OpHasAll  = model.OpHasAll
+	OpHasNone = model.OpHasNone
 )
 
 // Condition-tree builders.
@@ -524,6 +534,40 @@ const (
 	AttrAction       = attr.Action
 	AttrTimeHour     = attr.TimeHour
 )
+
+// --- Role, group and resource hierarchies -----------------------------------
+
+// Hierarchy is a membership DAG: role inheritance, nested groups, or resource
+// containment.
+//
+// It is resolved *outside* the engine. A principal holding "admin" in a graph
+// where admin inherits editor inherits viewer arrives carrying
+// subject.roles = "admin,editor,viewer", and an ordinary indexed operator
+// (OpHasAny) answers the question. The engine gains no new concept, the index
+// still prunes, and the evaluation path is untouched — the same division of
+// labour that keeps parsing and I/O outside the hot path.
+type Hierarchy = hierarchy.Graph
+
+// NewHierarchy returns an empty, unfrozen membership graph. Call Add to record
+// that a child is subsumed by its parents, then Freeze.
+func NewHierarchy() *Hierarchy { return hierarchy.New() }
+
+// HierarchyFromMap builds and freezes a graph from a child -> parents mapping,
+// which is the shape a configuration file naturally carries. It reports an error
+// if the graph contains a cycle.
+//
+//	roles, err := tessaraop.HierarchyFromMap(map[string][]string{
+//	    "admin":  {"editor"},
+//	    "editor": {"viewer"},
+//	})
+func HierarchyFromMap(m map[string][]string) (*Hierarchy, error) {
+	return hierarchy.FromMap(m)
+}
+
+// ErrHierarchyCycle is reported when a membership graph is not acyclic. A cycle
+// is always an authoring mistake, and tolerating one would make a principal's
+// effective roles depend on traversal order.
+var ErrHierarchyCycle = hierarchy.ErrCycle
 
 // Header returns the attribute name for an HTTP request header.
 func Header(name string) string { return attr.Header(name) }

@@ -42,8 +42,20 @@ import (
 	"time"
 
 	"github.com/suga/tessaraop/internal/attr"
+	"github.com/suga/tessaraop/internal/hierarchy"
 	"github.com/suga/tessaraop/internal/model"
 )
+
+// containsString reports membership, used to fold a primary role into the role
+// set without duplicating it.
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
 
 // Builder accumulates attributes and produces a model.Request.
 //
@@ -64,6 +76,13 @@ type Builder struct {
 	// cookies is the set of cookie names whose values may become attributes.
 	// Nil means none, which is the default; see WithCookies.
 	cookies map[string]bool
+
+	// roles and groups expand a principal's direct memberships into their
+	// transitive closures. Nil means no expansion.
+	roles  *hierarchy.Graph
+	groups *hierarchy.Graph
+	// resources expands a resource's containment path into its ancestors.
+	resources *hierarchy.Graph
 }
 
 // DefaultBodyLimit bounds payload inspection. Bodies are only read when a caller
@@ -117,6 +136,39 @@ func (b *Builder) WithCookies(names ...string) *Builder {
 		if n != "" {
 			b.cookies[n] = true
 		}
+	}
+	return b
+}
+
+// WithRoleHierarchy expands a principal's roles into their transitive closure.
+//
+// A subject holding "admin" in a graph where admin inherits editor inherits
+// viewer arrives at the engine carrying
+// subject.roles = "admin,editor,viewer", so a policy written against
+// `subject.roles has_any ["viewer"]` matches without knowing the role model.
+//
+// The graph must be frozen; an unfrozen one is ignored rather than silently
+// producing partial closures.
+func (b *Builder) WithRoleHierarchy(g *hierarchy.Graph) *Builder {
+	if g != nil && g.Frozen() {
+		b.roles = g
+	}
+	return b
+}
+
+// WithGroupHierarchy does the same for nested group membership.
+func (b *Builder) WithGroupHierarchy(g *hierarchy.Graph) *Builder {
+	if g != nil && g.Frozen() {
+		b.groups = g
+	}
+	return b
+}
+
+// WithResourceHierarchy expands a resource into its containment ancestors, so a
+// policy scoped to a folder or project matches everything beneath it.
+func (b *Builder) WithResourceHierarchy(g *hierarchy.Graph) *Builder {
+	if g != nil && g.Frozen() {
+		b.resources = g
 	}
 	return b
 }
@@ -606,14 +658,36 @@ func (b *Builder) FromSubject(s *SubjectInfo) *Builder {
 	if s.Role != "" {
 		b.Set(attr.SubjectRole, s.Role)
 	}
-	if len(s.Roles) > 0 {
-		b.Set("subject.roles", strings.Join(s.Roles, ","))
+
+	// subject.roles carries the *closure* when a hierarchy is configured, and the
+	// direct roles otherwise. subject.role stays the principal's own primary role
+	// either way, so a policy can still distinguish "is an admin" from "has at
+	// least an admin's permissions".
+	//
+	// The primary role is folded into the set as well, so a caller that only sets
+	// Role still gets a usable subject.roles rather than an absent attribute that
+	// fails every has_any check closed.
+	roles := s.Roles
+	if s.Role != "" && !containsString(roles, s.Role) {
+		roles = append(append([]string(nil), roles...), s.Role)
 	}
+	if len(roles) > 0 {
+		if b.roles != nil {
+			b.Set("subject.roles", hierarchy.Join(b.roles.ClosureOf(roles...)))
+		} else {
+			b.Set("subject.roles", strings.Join(roles, ","))
+		}
+	}
+
 	if s.Department != "" {
 		b.Set("subject.department", s.Department)
 	}
 	if len(s.Groups) > 0 {
-		b.Set("subject.groups", strings.Join(s.Groups, ","))
+		if b.groups != nil {
+			b.Set("subject.groups", hierarchy.Join(b.groups.ClosureOf(s.Groups...)))
+		} else {
+			b.Set("subject.groups", strings.Join(s.Groups, ","))
+		}
 	}
 	b.SetBool(attr.MFAVerified, s.MFAVerified)
 	b.SetBool("subject.device_managed", s.DeviceManaged)
@@ -633,6 +707,11 @@ func (b *Builder) FromResource(resourceType, id, resourcePath, sensitivity strin
 	}
 	if id != "" {
 		b.Set("resource.id", id)
+		// Containment ancestors, so a policy scoped to a folder or project
+		// matches everything beneath it without enumerating children.
+		if b.resources != nil {
+			b.Set("resource.ancestors", hierarchy.Join(b.resources.Closure(id)))
+		}
 	}
 	if resourcePath != "" {
 		b.Set(attr.ResourcePath, resourcePath)

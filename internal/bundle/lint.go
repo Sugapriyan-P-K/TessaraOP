@@ -334,9 +334,21 @@ func lintLeafOperands(n *Node, path string, op model.Operator) []Diagnostic {
 
 	case model.OpIn, model.OpNotIn, model.OpContains, model.OpNotContains,
 		model.OpPrefix, model.OpNotPrefix, model.OpSuffix, model.OpNotSuffix,
-		model.OpDNSSuffix, model.OpNotDNSSuffix:
+		model.OpDNSSuffix, model.OpNotDNSSuffix,
+		model.OpHasAny, model.OpHasAll, model.OpHasNone:
 		if len(n.Values) == 0 {
 			add(Error, "operator %q needs at least one value", op)
+		}
+		// A value containing the set delimiter can never match a single element,
+		// because the attribute is split on it before comparison.
+		if op == model.OpHasAny || op == model.OpHasAll || op == model.OpHasNone {
+			for i, v := range n.Values {
+				if strings.ContainsRune(v, model.SetDelimiter) {
+					add(Error, "value %d (%q) contains the set delimiter %q; "+
+						"list elements separately instead, since %q compares whole elements",
+						i, v, string(model.SetDelimiter), op)
+				}
+			}
 		}
 		// An empty string as the *only* value is almost always an editing
 		// mistake. Among several it is often deliberate and correct: a NULL TCP
@@ -347,6 +359,16 @@ func lintLeafOperands(n *Node, path string, op model.Operator) []Diagnostic {
 		if len(n.Values) == 1 && n.Values[0] == "" {
 			add(Warning, "the only value is an empty string; %q against \"\" matches "+
 				"just the present-and-empty case, which is rarely the intent", op)
+		}
+		// Using contains on an attribute the registry documents as a set is the
+		// privilege-escalation trap the has_* operators exist to close: a
+		// principal holding only "readwrite" satisfies `contains "read"`.
+		if op == model.OpContains || op == model.OpNotContains {
+			if isSetAttribute(n.Attr) {
+				add(Error, "%q is a comma-delimited set, and %q is a substring test: "+
+					"a principal holding only \"readwrite\" would satisfy contains \"read\". "+
+					"Use has_any / has_all / has_none.", n.Attr, op)
+			}
 		}
 		if op == model.OpSuffix || op == model.OpNotSuffix {
 			for _, v := range n.Values {
@@ -447,6 +469,25 @@ func setFormOf(op model.Operator) model.Operator {
 	}
 	return model.OpIn
 }
+
+// setAttributes are the registry attributes documented as comma-delimited sets.
+// Applying a substring operator to one of them is an error, not a style problem —
+// see the diagnostic in lintLeafOperands.
+var setAttributes = map[string]bool{
+	"subject.roles":          true,
+	"subject.groups":         true,
+	"token.scopes":           true,
+	"token.audience":         true,
+	"transport.tcp_flags":    true,
+	"network.ip_options":     true,
+	"network.fragment_flags": true,
+	"threat.categories":      true,
+	"payload.dlp_categories": true,
+	"payload.schema_errors":  true,
+	"resource.ancestors":     true,
+}
+
+func isSetAttribute(name string) bool { return setAttributes[name] }
 
 // looksLikeHostname is a heuristic for the suffix/dnssuffix confusion warning. It
 // only needs to be right often enough to catch the mistake; a false positive

@@ -54,7 +54,7 @@ const goodBundle = `{
             {"attr": "subject.role", "op": "eq", "values": ["admin"]},
             {"attr": "subject.role", "op": "eq", "values": ["security-admin"]}
           ]},
-          {"not": {"attr": "subject.groups", "op": "contains", "values": ["contractor"]}},
+          {"not": {"attr": "subject.groups", "op": "has_any", "values": ["contractor"]}},
           {"attr": "subject.risk_score", "op": "range", "min": 0, "max": 30},
           {"attr": "network.source_ip", "op": "cidr", "prefixes": ["10.0.0.0/8"]},
           {"attr": "transport.dest_port", "op": "num_in", "numbers": [443, 8443]}
