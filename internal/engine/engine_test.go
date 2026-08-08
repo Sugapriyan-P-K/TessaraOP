@@ -43,10 +43,13 @@ func checkDecision(t *testing.T, policies []model.Policy, req model.Request,
 		t.Fatalf("%s\n naive:  %s\n engine: %s\n request: %+v", ctx, want, got, req)
 	}
 
-	if alg == model.FirstApplicable {
+	// These order the candidates deterministically, so attribution must agree
+	// exactly. The overrides algorithms do not, and are checked structurally
+	// below.
+	if alg == model.FirstApplicable || alg == model.OnlyOneApplicable {
 		if want.MatchedPolicyID != got.MatchedPolicyID || want.MatchedRuleID != got.MatchedRuleID {
-			t.Fatalf("%s: first-applicable must be deterministic\n naive:  %s\n engine: %s",
-				ctx, want, got)
+			t.Fatalf("%s: %s must be deterministic\n naive:  %s\n engine: %s",
+				ctx, alg, want, got)
 		}
 		return
 	}
@@ -94,9 +97,10 @@ func checkDecision(t *testing.T, policies []model.Policy, req model.Request,
 // discrepancy anywhere in the fast path surfaces here as a concrete failing
 // request rather than as a silent wrong answer.
 func TestDifferential_EngineMatchesNaive(t *testing.T) {
-	for _, alg := range []model.Algorithm{
-		model.DenyOverrides, model.PermitOverrides, model.FirstApplicable,
-	} {
+	// Every algorithm, including the three added for XACML conformance. A new
+	// algorithm that resolved differently in the indexed path than in the oracle
+	// would surface here as a concrete failing request.
+	for _, alg := range model.AllAlgorithms {
 		t.Run(string(alg), func(t *testing.T) {
 			for seed := int64(0); seed < 40; seed++ {
 				rng := rand.New(rand.NewSource(seed))
@@ -242,6 +246,58 @@ func TestTwoTier_ExceptionDoesNotLeakAcrossPolicies(t *testing.T) {
 	if d.Allowed {
 		t.Fatalf("the in-policy exception must not override another policy's deny, got %s", d)
 	}
+}
+
+// TestDifferential_UnionObligationsMatchesNaive checks that union mode does not
+// break the oracle relationship. It changes short-circuiting, so the indexed path
+// visits a different set of candidates than it otherwise would — exactly the kind
+// of change that can silently diverge.
+func TestDifferential_UnionObligationsMatchesNaive(t *testing.T) {
+	for seed := int64(0); seed < 20; seed++ {
+		rng := rand.New(rand.NewSource(3000 + seed))
+		corpus := genutil.Generate(genutil.Options{
+			Policies: 200, Tenants: 5, Global: 10, RulesPerPolicy: 4,
+		}, rng)
+
+		ref := naive.NewWith(corpus.Policies, model.DenyOverrides)
+		ref.UnionObligations = true
+		eng := New(corpus.Policies, Config{UnionObligations: true})
+
+		for q := 0; q < 20; q++ {
+			req := corpus.GenerateRequest(rng)
+			want, got := ref.Evaluate(req), eng.Evaluate(req)
+
+			if want.Allowed != got.Allowed || want.Effect != got.Effect {
+				t.Fatalf("seed=%d q=%d\n naive:  %s\n engine: %s", seed, q, want, got)
+			}
+			// Under union the obligation set is fully determined, so it must
+			// agree exactly — that is the whole point of the mode.
+			if !sameObligations(want.Obligations, got.Obligations) {
+				t.Fatalf("seed=%d q=%d: obligations differ\n naive:  %v\n engine: %v",
+					seed, q, want.Obligations, got.Obligations)
+			}
+		}
+	}
+}
+
+// sameObligations compares two obligation sets irrespective of order.
+func sameObligations(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, s := range a {
+		seen[s]++
+	}
+	for _, s := range b {
+		seen[s]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRulesScanned_IsFarBelowTheShard(t *testing.T) {

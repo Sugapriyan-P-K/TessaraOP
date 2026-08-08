@@ -38,8 +38,9 @@ type Engine struct {
 	tenantWide map[string]*index.Shard
 	global     *index.Shard
 
-	alg   model.Algorithm
-	cache *Cache
+	alg              model.Algorithm
+	unionObligations bool
+	cache            *Cache
 
 	scratch sync.Pool
 	total   int // policies
@@ -63,6 +64,12 @@ type Config struct {
 	// cache entirely, which is what the benchmarks use when measuring raw
 	// index performance rather than traffic locality.
 	CacheSize int
+
+	// UnionObligations collects obligations from every matching rule carrying the
+	// winning effect, rather than only from the one credited. It removes the
+	// attribution caveat at the cost of short-circuiting — see
+	// model.Accumulator.UnionObligations.
+	UnionObligations bool
 }
 
 // New builds an engine over the given policies, partitioning them into shards
@@ -95,10 +102,11 @@ func New(policies []model.Policy, cfg Config) *Engine {
 	}
 
 	e := &Engine{
-		scoped:     make(map[shardKey]*index.Shard, len(byScope)),
-		tenantWide: make(map[string]*index.Shard, len(wide)),
-		alg:        alg,
-		total:      len(policies),
+		scoped:           make(map[shardKey]*index.Shard, len(byScope)),
+		tenantWide:       make(map[string]*index.Shard, len(wide)),
+		alg:              alg,
+		unionObligations: cfg.UnionObligations,
+		total:            len(policies),
 	}
 	if len(globals) > 0 {
 		e.global = index.BuildShard(globals)
@@ -176,6 +184,7 @@ func (e *Engine) Evaluate(req model.Request) model.Decision {
 	defer e.scratch.Put(sc)
 
 	var acc model.Accumulator
+	acc.UnionObligations = e.unionObligations
 	acc.Reset(e.alg)
 	policies, rules := 0, 0
 

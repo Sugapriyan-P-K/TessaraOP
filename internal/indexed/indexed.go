@@ -18,6 +18,9 @@ type Evaluator struct {
 	shard     *index.Shard
 	scratch   *index.Scratch
 	Algorithm model.Algorithm
+
+	// UnionObligations mirrors the engine setting.
+	UnionObligations bool
 }
 
 // New builds an indexed evaluator over the policies using deny-overrides.
@@ -41,6 +44,7 @@ func NewWith(policies []model.Policy, alg model.Algorithm) *Evaluator {
 // The sharded engine pools scratch per goroutine and is the concurrent path.
 func (e *Evaluator) Evaluate(req model.Request) model.Decision {
 	var acc model.Accumulator
+	acc.UnionObligations = e.UnionObligations
 	acc.Reset(e.Algorithm)
 	policies, rules := e.shard.Evaluate(req, e.scratch, &acc)
 	acc.SetScanned(policies, rules)

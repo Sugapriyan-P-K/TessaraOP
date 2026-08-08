@@ -97,6 +97,17 @@ const (
 	PermitOverrides = model.PermitOverrides
 	FirstApplicable = model.FirstApplicable
 
+	// DenyUnlessPermit and OnlyOneApplicable complete the order-independent
+	// XACML 3.0 set. OnlyOneApplicable is the genuinely distinct one: it detects
+	// ambiguity rather than resolving it, denying when several units apply.
+	DenyUnlessPermit  = model.DenyUnlessPermit
+	OnlyOneApplicable = model.OnlyOneApplicable
+
+	// PermitUnlessDeny grants by default: a request matching nothing is ALLOWED.
+	// That inverts the fail-closed posture the rest of this engine holds to.
+	// Confine it to a shard whose contents are exhaustively known.
+	PermitUnlessDeny = model.PermitUnlessDeny
+
 	// GlobalTenant holds platform-wide policies evaluated for every request,
 	// whatever tenant it names: blocklists, kill switches, baseline denies.
 	GlobalTenant = model.GlobalTenant
@@ -186,6 +197,17 @@ type Config struct {
 	// largest win available.
 	CacheSize int
 
+	// UnionObligations collects obligations from every matching rule carrying the
+	// winning effect, rather than only from the one credited.
+	//
+	// It removes the caveat on Algorithm above — that obligations depend on which
+	// of several equally-valid matches was reached first — and it is what XACML
+	// specifies. The cost is short-circuiting: the engine must see every
+	// candidate, so deny-overrides can no longer stop at the first deny. Enable
+	// it where a dropped require_mfa would be a security incident; leave it off
+	// where throughput dominates.
+	UnionObligations bool
+
 	// Lint tunes validation of bundles loaded through this PDP.
 	Lint LintOptions
 }
@@ -267,8 +289,9 @@ func (p *PDP) Reload(policies []Policy) error {
 	copy(owned, policies)
 
 	next := engine.New(owned, engine.Config{
-		Algorithm: p.cfg.Algorithm,
-		CacheSize: p.cfg.CacheSize,
+		Algorithm:        p.cfg.Algorithm,
+		CacheSize:        p.cfg.CacheSize,
+		UnionObligations: p.cfg.UnionObligations,
 	})
 	p.current.Store(next)
 	p.generation.Add(1)

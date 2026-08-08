@@ -14,6 +14,10 @@ import "github.com/suga/tessaraop/internal/model"
 type Evaluator struct {
 	Policies  []model.Policy
 	Algorithm model.Algorithm
+
+	// UnionObligations mirrors the engine setting, so the oracle and the fast
+	// path answer the same question when it is enabled.
+	UnionObligations bool
 }
 
 // New constructs a naive evaluator using deny-overrides.
@@ -38,6 +42,7 @@ func NewWith(policies []model.Policy, alg model.Algorithm) *Evaluator {
 // trustworthy oracle for the differential tests.
 func (e *Evaluator) Evaluate(req model.Request) model.Decision {
 	acc := model.NewAccumulator(e.Algorithm)
+	acc.UnionObligations = e.UnionObligations
 	policies, rules := 0, 0
 	for i := range e.Policies {
 		p := &e.Policies[i]

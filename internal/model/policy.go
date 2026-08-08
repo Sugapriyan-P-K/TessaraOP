@@ -103,7 +103,14 @@ func (p *Policy) Prepare() error {
 // It reports the verdict, whether any rule matched at all, and how many rules
 // reached exact validation.
 func (p *Policy) Resolve(req Request) (Verdict, bool, int) {
+	return p.ResolveUnion(req, false)
+}
+
+// ResolveUnion is Resolve with explicit control over obligation union semantics,
+// so the inner tier applies the same rule the outer one was configured with.
+func (p *Policy) ResolveUnion(req Request, unionObligations bool) (Verdict, bool, int) {
 	var acc Accumulator
+	acc.UnionObligations = unionObligations
 	acc.Reset(p.RuleAlgorithm)
 	scanned := 0
 	for i := range p.Rules {
@@ -116,6 +123,11 @@ func (p *Policy) Resolve(req Request) (Verdict, bool, int) {
 		}
 	}
 	v, ok := acc.Winner()
+	if ok {
+		if union := acc.obligationsFor(v.Effect); union != nil {
+			v.Obligations = union
+		}
+	}
 	return v, ok, scanned
 }
 
@@ -124,7 +136,13 @@ func (p *Policy) Resolve(req Request) (Verdict, bool, int) {
 // index that has drifted from its policies degrades to under-selective instead
 // of crashing the decision path.
 func (p *Policy) ResolveAt(req Request, positions []int) (Verdict, bool, int) {
+	return p.ResolveAtUnion(req, positions, false)
+}
+
+// ResolveAtUnion is ResolveAt with explicit obligation union semantics.
+func (p *Policy) ResolveAtUnion(req Request, positions []int, unionObligations bool) (Verdict, bool, int) {
 	var acc Accumulator
+	acc.UnionObligations = unionObligations
 	acc.Reset(p.RuleAlgorithm)
 	scanned := 0
 	for _, i := range positions {
@@ -140,6 +158,11 @@ func (p *Policy) ResolveAt(req Request, positions []int) (Verdict, bool, int) {
 		}
 	}
 	v, ok := acc.Winner()
+	if ok {
+		if union := acc.obligationsFor(v.Effect); union != nil {
+			v.Obligations = union
+		}
+	}
 	return v, ok, scanned
 }
 
@@ -180,10 +203,49 @@ const (
 	// engine must see every candidate — strictly more expensive than
 	// DenyOverrides. Needed for exception rules ("deny all except X").
 	FirstApplicable Algorithm = "first-applicable"
+
+	// DenyUnlessPermit: any matching Allow wins; everything else denies.
+	//
+	// It differs from PermitOverrides only in attribution. With no Allow but a
+	// matching Deny, PermitOverrides credits that Deny while this credits
+	// nothing, because XACML defines this algorithm as never producing an
+	// Indeterminate or NotApplicable result — it always resolves to Permit or
+	// Deny. The enforceable outcome is identical. Provided for conformance and
+	// for policy sets migrated from an XACML engine.
+	DenyUnlessPermit Algorithm = "deny-unless-permit"
+
+	// PermitUnlessDeny: any matching Deny wins; everything else permits.
+	//
+	// This is the one algorithm here that grants by default. A request matching
+	// nothing at all is ALLOWED, which inverts the fail-closed posture the rest
+	// of this engine is built on. It exists because XACML defines it and some
+	// migrated policy sets depend on it; it should be confined to a shard whose
+	// contents are exhaustively known, never used as a corpus-wide default.
+	PermitUnlessDeny Algorithm = "permit-unless-deny"
+
+	// OnlyOneApplicable: exactly one unit may apply. If several do, the result is
+	// Indeterminate, which this engine resolves as a deny.
+	//
+	// Unlike the algorithms above this one is genuinely distinct: it detects
+	// ambiguity rather than resolving it. Use it where overlapping policies
+	// indicate a configuration error that should fail loudly — a routing table
+	// where two rules claim the same traffic, say — rather than being silently
+	// arbitrated.
+	OnlyOneApplicable Algorithm = "only-one-applicable"
 )
 
 // AllAlgorithms lists every combining algorithm, for the linter and docs.
-var AllAlgorithms = []Algorithm{DenyOverrides, PermitOverrides, FirstApplicable}
+//
+// The XACML "ordered-" variants are deliberately absent. They resolve ties by
+// document order, and this engine's index yields candidates in whatever order
+// the underlying sets enumerate — so honouring document order would mean sorting
+// every candidate set and forfeiting the short-circuiting that order-independence
+// buys. FirstApplicable covers the same intent with an explicit Priority, which
+// is order-independent and therefore sound here.
+var AllAlgorithms = []Algorithm{
+	DenyOverrides, PermitOverrides, FirstApplicable,
+	DenyUnlessPermit, PermitUnlessDeny, OnlyOneApplicable,
+}
 
 // Verdict is one resolved outcome, produced by either tier. The inner tier
 // emits a Verdict per matching rule; the outer tier emits one per matching
@@ -208,6 +270,17 @@ type Verdict struct {
 type Accumulator struct {
 	Algorithm Algorithm
 
+	// UnionObligations collects obligations from every matching verdict carrying
+	// the winning effect, rather than only from the one credited.
+	//
+	// It removes the attribution caveat that otherwise makes obligations depend
+	// on which of several equally-valid matches the evaluator reached first, and
+	// it is what XACML actually specifies. The cost is that it forfeits
+	// short-circuiting: the accumulator must see every candidate to collect from
+	// them, so DenyOverrides can no longer stop at the first Deny. Off by
+	// default for that reason.
+	UnionObligations bool
+
 	foundDeny bool
 	deny      Verdict
 
@@ -216,6 +289,13 @@ type Accumulator struct {
 
 	foundBest bool
 	best      Verdict
+
+	// applicable counts matching verdicts, for OnlyOneApplicable.
+	applicable int
+
+	// Collected per effect, since the winning effect is not known until Resolve.
+	denyObligations  []string
+	allowObligations []string
 
 	policiesScanned int
 	rulesScanned    int
@@ -231,17 +311,33 @@ func NewAccumulator(alg Algorithm) *Accumulator {
 
 // Reset clears the accumulator for reuse under alg. Empty alg means
 // DenyOverrides.
+// Reset preserves UnionObligations, so the inner tier inherits the outer tier's
+// obligation semantics rather than silently diverging from it.
 func (a *Accumulator) Reset(alg Algorithm) {
 	if alg == "" {
 		alg = DenyOverrides
 	}
-	*a = Accumulator{Algorithm: alg}
+	union := a.UnionObligations
+	*a = Accumulator{Algorithm: alg, UnionObligations: union}
 }
 
 // Consider feeds one verdict that has already been confirmed to apply.
 func (a *Accumulator) Consider(v Verdict) {
+	a.applicable++
+
+	if a.UnionObligations && len(v.Obligations) > 0 {
+		if v.Effect == Deny {
+			a.denyObligations = appendMissing(a.denyObligations, v.Obligations)
+		} else {
+			a.allowObligations = appendMissing(a.allowObligations, v.Obligations)
+		}
+	}
+
 	switch a.Algorithm {
-	case FirstApplicable:
+	case FirstApplicable, OnlyOneApplicable:
+		// OnlyOneApplicable shares the priority ordering so that when exactly one
+		// verdict applies it is credited deterministically; the ambiguity check
+		// happens in Winner.
 		if !a.foundBest || outranks(v, a.best) {
 			a.foundBest = true
 			a.best = v
@@ -259,6 +355,24 @@ func (a *Accumulator) Consider(v Verdict) {
 			}
 		}
 	}
+}
+
+// appendMissing adds any obligation not already present, preserving order. The
+// lists are short — a handful of entries — so a linear scan beats a map.
+func appendMissing(dst, src []string) []string {
+	for _, s := range src {
+		found := false
+		for _, existing := range dst {
+			if existing == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, s)
+		}
+	}
+	return dst
 }
 
 // outranks reports whether a should beat b under FirstApplicable.
@@ -281,6 +395,11 @@ func outranks(a, b Verdict) bool {
 // may stop scanning. Only DenyOverrides can short-circuit (on the first Deny) —
 // the others must see every candidate.
 func (a *Accumulator) CanShortCircuit() bool {
+	if a.UnionObligations {
+		// Stopping early would miss obligations on candidates not yet seen, which
+		// is the whole point of collecting them.
+		return false
+	}
 	return a.Algorithm == DenyOverrides && a.foundDeny
 }
 
@@ -296,13 +415,37 @@ func (a *Accumulator) Winner() (Verdict, bool) {
 	switch a.Algorithm {
 	case FirstApplicable:
 		return a.best, a.foundBest
-	case PermitOverrides:
+
+	case OnlyOneApplicable:
+		// Several applicable units is Indeterminate. Reporting no winner resolves
+		// it to a deny at the outer tier, which is the fail-closed reading — and
+		// the point of choosing this algorithm is that the overlap is a
+		// configuration error, so it must not be silently arbitrated.
+		if a.applicable == 1 {
+			return a.best, true
+		}
+		return Verdict{}, false
+
+	case PermitOverrides, DenyUnlessPermit:
 		if a.foundAllow {
 			return a.allow, true
+		}
+		if a.Algorithm == DenyUnlessPermit {
+			// Never credits a Deny: this algorithm resolves to Permit or Deny and
+			// nothing else, so an unmatched Allow simply means Deny with no
+			// attribution.
+			return Verdict{}, false
 		}
 		if a.foundDeny {
 			return a.deny, true
 		}
+
+	case PermitUnlessDeny:
+		if a.foundDeny {
+			return a.deny, true
+		}
+		return Verdict{}, false
+
 	default: // DenyOverrides
 		if a.foundDeny {
 			return a.deny, true
@@ -314,24 +457,57 @@ func (a *Accumulator) Winner() (Verdict, bool) {
 	return Verdict{}, false
 }
 
+// obligationsFor returns the collected obligations for an effect when union
+// semantics are on, and nil otherwise.
+func (a *Accumulator) obligationsFor(e Effect) []string {
+	if !a.UnionObligations {
+		return nil
+	}
+	if e == Deny {
+		return a.denyObligations
+	}
+	return a.allowObligations
+}
+
 // Resolve produces the final decision under the configured algorithm.
 func (a *Accumulator) Resolve() Decision {
 	v, ok := a.Winner()
 	if !ok {
-		// Default deny: nothing matched at all.
+		// Nothing was credited. Every algorithm but one resolves that to a deny.
+		//
+		// PermitUnlessDeny is the exception: it grants unless a Deny matched, so
+		// an unmatched request is ALLOWED. That inverts the fail-closed posture
+		// the rest of this engine holds to, which is why the algorithm's
+		// documentation says to confine it to a shard whose contents are
+		// exhaustively known.
+		if a.Algorithm == PermitUnlessDeny {
+			return Decision{
+				Allowed:         true,
+				Effect:          Allow,
+				Obligations:     a.obligationsFor(Allow),
+				PoliciesScanned: a.policiesScanned,
+				RulesScanned:    a.rulesScanned,
+			}
+		}
 		return Decision{
 			Allowed:         false,
 			Effect:          Deny,
+			Obligations:     a.obligationsFor(Deny),
 			PoliciesScanned: a.policiesScanned,
 			RulesScanned:    a.rulesScanned,
 		}
+	}
+
+	obligations := v.Obligations
+	if union := a.obligationsFor(v.Effect); union != nil {
+		obligations = union
 	}
 	return Decision{
 		Allowed:         v.Effect == Allow,
 		Effect:          v.Effect,
 		MatchedPolicyID: v.PolicyID,
 		MatchedRuleID:   v.RuleID,
-		Obligations:     v.Obligations,
+		Obligations:     obligations,
 		PoliciesScanned: a.policiesScanned,
 		RulesScanned:    a.rulesScanned,
 	}
@@ -350,20 +526,34 @@ func outerVerdict(p *Policy, v Verdict) Verdict {
 // reference implementation used by the naive evaluator and by differential
 // tests. It applies no tenant scoping — callers that need it filter first.
 func Evaluate(policies []Policy, req Request, alg Algorithm) Decision {
+	return EvaluateUnion(policies, req, alg, false)
+}
+
+// EvaluateUnion is Evaluate with explicit obligation union semantics. The naive
+// evaluator and the indexed engine both route through this, so a differential
+// test can exercise union mode on both sides.
+func EvaluateUnion(policies []Policy, req Request, alg Algorithm, unionObligations bool) Decision {
 	acc := NewAccumulator(alg)
+	acc.UnionObligations = unionObligations
 	rules := 0
 	for i := range policies {
-		v, ok, scanned := policies[i].Resolve(req)
-		rules += scanned
-		if ok {
-			acc.Consider(outerVerdict(&policies[i], v))
-			if acc.CanShortCircuit() {
-				break
-			}
+		rules += ConsiderPolicy(&policies[i], req, allRulePositions(&policies[i]), acc)
+		if acc.CanShortCircuit() {
+			break
 		}
 	}
 	acc.SetScanned(len(policies), rules)
 	return acc.Resolve()
+}
+
+// allRulePositions returns every rule index in p. Only the reference path uses
+// it; the indexed path supplies the positions the index selected.
+func allRulePositions(p *Policy) []int {
+	out := make([]int, len(p.Rules))
+	for i := range out {
+		out[i] = i
+	}
+	return out
 }
 
 // EvaluatePolicyPositions validates only the policies at the given positions,
@@ -394,7 +584,7 @@ func EvaluatePolicyPositions(policies []Policy, positions []int, req Request, al
 // positions names the rule indices the index selected as candidates. It returns
 // how many rules reached exact validation.
 func ConsiderPolicy(p *Policy, req Request, positions []int, acc *Accumulator) int {
-	v, ok, scanned := p.ResolveAt(req, positions)
+	v, ok, scanned := p.ResolveAtUnion(req, positions, acc.UnionObligations)
 	if ok {
 		acc.Consider(outerVerdict(p, v))
 	}
