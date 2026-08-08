@@ -243,6 +243,143 @@ func TestDecision_OnDecisionHookFires(t *testing.T) {
 	}
 }
 
+// --- Explain -----------------------------------------------------------------
+
+func TestExplain_AnswersWhy(t *testing.T) {
+	srv := newServer(t, Config{})
+	w := postJSON(t, srv, "/v1/explain", `{
+	  "tenant": "acme",
+	  "attributes": {"subject.role": "viewer", "action": "read"}
+	}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body)
+	}
+
+	var got struct {
+		Explanation struct {
+			Summary  string `json:"summary"`
+			Decision struct {
+				Allowed bool `json:"allowed"`
+			} `json:"decision"`
+			Policies []struct {
+				PolicyID string `json:"policy_id"`
+				Rules    []struct {
+					RuleID string `json:"rule_id"`
+					Why    string `json:"why"`
+				} `json:"rules"`
+			} `json:"policies"`
+		} `json:"explanation"`
+		Unmatched []struct {
+			Attribute string `json:"attribute"`
+			Failures  int    `json:"failures"`
+		} `json:"unmatched_attributes"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Explanation.Decision.Allowed {
+		t.Fatalf("a viewer should be denied, got %+v", got.Explanation)
+	}
+	if got.Explanation.Summary == "" {
+		t.Error("expected a one-line summary")
+	}
+	if len(got.Explanation.Policies) == 0 {
+		t.Fatal("expected per-policy traces")
+	}
+	// The failing conditions should be named. Which one leads depends on the
+	// corpus, so this asserts presence rather than a brittle ordering.
+	named := map[string]bool{}
+	for _, u := range got.Unmatched {
+		named[u.Attribute] = true
+	}
+	if !named["subject.role"] {
+		t.Errorf("subject.role failed and should be reported, got %+v", got.Unmatched)
+	}
+}
+
+// TestExplain_RedactsUnlessAllowed is the security property. A trace echoes what
+// the request carried, and this endpoint is reachable by anyone who can reach the
+// PDP, so blanket value revelation has to be enabled server-side.
+func TestExplain_RedactsUnlessAllowed(t *testing.T) {
+	body := `{"tenant":"acme","attributes":{"subject.role":"super-secret-role"},
+	          "reveal_values":true}`
+
+	// Default: refused, and the refusal is reported rather than silently ignored.
+	srv := newServer(t, Config{})
+	w := postJSON(t, srv, "/v1/explain", body)
+	if strings.Contains(w.Body.String(), "super-secret-role") {
+		t.Fatal("reveal_values must be refused unless the server allows it")
+	}
+	if !strings.Contains(w.Body.String(), "was refused") {
+		t.Error("the refusal should be reported in warnings")
+	}
+
+	// Enabled server-side: honoured.
+	allowed := newServer(t, Config{AllowExplainRevealValues: true})
+	w = postJSON(t, allowed, "/v1/explain", body)
+	if !strings.Contains(w.Body.String(), "super-secret-role") {
+		t.Error("with AllowExplainRevealValues the value should be shown")
+	}
+}
+
+// TestExplain_RevealAttributesIsAlwaysPermitted covers the middle ground: naming
+// an attribute is an explicit, auditable choice, unlike revealing everything.
+func TestExplain_RevealAttributesIsAlwaysPermitted(t *testing.T) {
+	srv := newServer(t, Config{})
+	w := postJSON(t, srv, "/v1/explain", `{
+	  "tenant": "acme",
+	  "attributes": {"subject.role": "viewer", "session.id": "secret"},
+	  "reveal_attributes": ["subject.role"]
+	}`)
+	body := w.Body.String()
+	if !strings.Contains(body, "viewer") {
+		t.Error("a named attribute should be shown even on a default server")
+	}
+	if strings.Contains(body, "secret") {
+		t.Error("an unnamed attribute must stay redacted")
+	}
+}
+
+func TestExplain_MethodNotAllowed(t *testing.T) {
+	srv := newServer(t, Config{})
+	w := do(t, srv, httptest.NewRequest(http.MethodGet, "/v1/explain", nil))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d want 405", w.Code)
+	}
+}
+
+// TestExplain_AgreesWithDecisionEndpoint is the cross-endpoint version of the
+// property the explain package tests internally: the two must not disagree.
+func TestExplain_AgreesWithDecisionEndpoint(t *testing.T) {
+	srv := newServer(t, Config{})
+	bodies := []string{
+		`{"tenant":"acme","attributes":{"subject.role":"admin","action":"read"}}`,
+		`{"tenant":"acme","attributes":{"subject.role":"viewer"}}`,
+		`{"tenant":"acme","scope":"network","numeric":{"transport.dest_port":443}}`,
+		`{"tenant":"acme","ips":{"network.source_ip":"203.0.113.9"}}`,
+		`{"tenant":"nobody"}`,
+	}
+	for i, body := range bodies {
+		var dec DecisionResponse
+		_ = json.Unmarshal(postJSON(t, srv, "/v1/decision", body).Body.Bytes(), &dec)
+
+		var exp struct {
+			Explanation struct {
+				Decision DecisionResponse `json:"decision"`
+			} `json:"explanation"`
+		}
+		_ = json.Unmarshal(postJSON(t, srv, "/v1/explain", body).Body.Bytes(), &exp)
+
+		if dec.Allowed != exp.Explanation.Decision.Allowed ||
+			dec.Effect != exp.Explanation.Decision.Effect {
+			t.Errorf("case %d: /v1/decision says %v/%s but /v1/explain says %v/%s",
+				i, dec.Allowed, dec.Effect,
+				exp.Explanation.Decision.Allowed, exp.Explanation.Decision.Effect)
+		}
+	}
+}
+
 // --- Forward-auth / ext_authz ----------------------------------------------
 
 // TestForwardAuth_StatusCodesOnly pins the contract every proxy in this family

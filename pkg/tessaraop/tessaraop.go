@@ -52,6 +52,7 @@ import (
 	"github.com/suga/tessaraop/internal/attr"
 	"github.com/suga/tessaraop/internal/bundle"
 	"github.com/suga/tessaraop/internal/engine"
+	"github.com/suga/tessaraop/internal/explain"
 	"github.com/suga/tessaraop/internal/hierarchy"
 	"github.com/suga/tessaraop/internal/model"
 )
@@ -214,10 +215,18 @@ type Config struct {
 
 // PDP is a policy decision point: an immutable indexed policy set behind an
 // atomic pointer, plus the counters an operator needs to see it working.
+// installed is one atomically-swappable policy set: the indexed engine that
+// answers requests, plus the policies themselves, which Explain needs because it
+// deliberately bypasses the index.
+type installed struct {
+	eng      *engine.Engine
+	policies []Policy
+}
+
 type PDP struct {
 	cfg Config
 
-	current atomic.Pointer[engine.Engine]
+	current atomic.Pointer[installed]
 
 	// reload serializes Reload so two concurrent callers cannot interleave
 	// building and swapping. Evaluate never takes it.
@@ -293,7 +302,7 @@ func (p *PDP) Reload(policies []Policy) error {
 		CacheSize:        p.cfg.CacheSize,
 		UnionObligations: p.cfg.UnionObligations,
 	})
-	p.current.Store(next)
+	p.current.Store(&installed{eng: next, policies: owned})
 	p.generation.Add(1)
 	p.metrics.Reloads.Add(1)
 	return nil
@@ -361,13 +370,13 @@ func openBundle(b *Bundle, cfg Config) (*PDP, []Diagnostic, error) {
 
 // Evaluate renders a decision. Safe for concurrent use.
 func (p *PDP) Evaluate(req Request) Decision {
-	eng := p.current.Load()
-	if eng == nil {
+	cur := p.current.Load()
+	if cur == nil {
 		// Only reachable if a caller built a zero-value PDP directly instead of
 		// through New. Fail closed rather than panic in a request path.
 		return Decision{Allowed: false, Effect: Deny}
 	}
-	d := eng.Evaluate(req)
+	d := cur.eng.Evaluate(req)
 
 	p.metrics.Evaluations.Add(1)
 	p.metrics.RulesTested.Add(uint64(d.RulesScanned))
@@ -421,10 +430,11 @@ type Info struct {
 
 // Info reports what is currently installed.
 func (p *PDP) Info() Info {
-	eng := p.current.Load()
-	if eng == nil {
+	cur := p.current.Load()
+	if cur == nil {
 		return Info{Generation: p.generation.Load()}
 	}
+	eng := cur.eng
 	alg := p.cfg.Algorithm
 	if alg == "" {
 		alg = DenyOverrides
@@ -446,11 +456,64 @@ func (p *PDP) Info() Info {
 // reach. It is the number that governs per-request cost, and the one to watch
 // when a customer's shard grows.
 func (p *PDP) ReachableRules(tenantID, scope string) int {
-	eng := p.current.Load()
-	if eng == nil {
+	cur := p.current.Load()
+	if cur == nil {
 		return 0
 	}
-	return eng.InScope(tenantID, scope)
+	return cur.eng.InScope(tenantID, scope)
+}
+
+// --- Explain ----------------------------------------------------------------
+
+// Explanation is the full account of why a decision came out as it did.
+type Explanation = explain.Explanation
+
+// ExplainOptions controls how much an explanation reveals.
+type ExplainOptions = explain.Options
+
+// DefaultExplainOptions redacts observed attribute values, includes rules that
+// did not match, and omits policies the request could not reach.
+func DefaultExplainOptions() ExplainOptions { return explain.DefaultOptions() }
+
+// Explain reports why the request produced the decision it did: which policies
+// were in scope, which rules were evaluated, and for each condition whether the
+// attribute was present and whether it matched.
+//
+// It is a deliberately slower second path. Evaluate is allocation-free and runs
+// in microseconds; threading a trace through it would cost that for every
+// request in order to serve the rare one where somebody is asking a question. So
+// Explain bypasses the index, evaluates every in-scope rule, and short-circuits
+// nowhere — an author wants every failing condition, not the first one checked.
+//
+// Do not call it on the hot path. Call it from a support tool, a CLI, or an
+// endpoint a human hits.
+//
+// The returned Decision is computed on the same inputs as Evaluate and is
+// asserted to agree with it; an explanation that contradicted the decision would
+// be worse than none, because it would be believed.
+func (p *PDP) Explain(req Request, opt ExplainOptions) *Explanation {
+	cur := p.current.Load()
+	if cur == nil {
+		return &Explanation{
+			Decision: Decision{Allowed: false, Effect: Deny},
+			Summary:  "DENIED: no policy set is installed",
+		}
+	}
+	alg := p.cfg.Algorithm
+	if alg == "" {
+		alg = DenyOverrides
+	}
+	return explain.Explain(cur.policies, req, alg, opt)
+}
+
+// Policies returns the installed policy set. The slice is owned by the PDP and
+// must not be modified; copy it if you need to.
+func (p *PDP) Policies() []Policy {
+	cur := p.current.Load()
+	if cur == nil {
+		return nil
+	}
+	return cur.policies
 }
 
 // --- Bundle helpers ---------------------------------------------------------

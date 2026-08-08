@@ -104,7 +104,7 @@
               {
                 "not": {
                   "attr": "subject.groups",
-                  "op": "contains",
+                  "op": "has_any",
                   "values": [
                     "contractor"
                   ]

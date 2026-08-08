@@ -23,6 +23,7 @@ import (
 	"github.com/suga/tessaraop/internal/attr"
 	"github.com/suga/tessaraop/internal/bundle"
 	"github.com/suga/tessaraop/internal/engine"
+	"github.com/suga/tessaraop/internal/explain"
 	"github.com/suga/tessaraop/internal/genutil"
 	"github.com/suga/tessaraop/internal/model"
 	"github.com/suga/tessaraop/internal/naive"
@@ -95,6 +96,49 @@ func main() {
 		return
 	}
 	runBench(eng, corpus, rng, *requests, *compare, cfg)
+}
+
+// printExplanation renders why a request produced the decision it did.
+//
+// Values are shown rather than redacted, because this runs against a local
+// synthetic corpus in a terminal the operator already owns. The server default is
+// the opposite.
+func printExplanation(policies []model.Policy, req model.Request, alg model.Algorithm) {
+	opt := explain.DefaultOptions()
+	opt.Redact = false
+	opt.MaxPolicies = 6
+	ex := explain.Explain(policies, req, alg, opt)
+
+	fmt.Printf("  Why:         %s\n", ex.Summary)
+
+	// The aggregate is usually the real answer during onboarding: a policy set
+	// that denies everything normally does so because one attribute is never
+	// supplied.
+	if unmatched := ex.UnmatchedAttributes(); len(unmatched) > 0 {
+		fmt.Printf("  Blocked on:  ")
+		parts := make([]string, 0, 4)
+		for i, u := range unmatched {
+			if i == 4 {
+				break
+			}
+			note := fmt.Sprintf("%s (%d)", u.Attribute, u.Failures)
+			if u.Absent == u.Failures {
+				note += " not supplied"
+			}
+			parts = append(parts, note)
+		}
+		fmt.Printf("%s\n", strings.Join(parts, ", "))
+	}
+
+	// One nearly-matching rule, which is what an author actually wants to see.
+	for _, p := range ex.Policies {
+		for _, r := range p.Rules {
+			if !r.Matched && r.Why != "" {
+				fmt.Printf("  Closest:     %s/%s — %s\n", p.PolicyID, r.RuleID, r.Why)
+				return
+			}
+		}
+	}
 }
 
 // runLint validates a bundle and reports findings, returning the process exit
@@ -462,6 +506,10 @@ func runInteractive(eng *engine.Engine, c *genutil.Corpus) {
 		if len(got.Obligations) > 0 {
 			fmt.Printf("  Obligations: %s\n", strings.Join(got.Obligations, ", "))
 		}
+		// The explanation, which is why interactive mode is useful at all: a bare
+		// DENY tells an author nothing about which condition defeated them.
+		printExplanation(c.Policies, req, model.DenyOverrides)
+
 		fmt.Printf("  Engine:      %v, validated %d rules across %d policies\n",
 			engDur.Round(time.Nanosecond), got.RulesScanned, got.PoliciesScanned)
 		fmt.Printf("  Naive:       %v, scanned %d rules (%.0fx slower)\n",

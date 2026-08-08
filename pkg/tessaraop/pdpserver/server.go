@@ -85,6 +85,17 @@ type Config struct {
 	// logging. It runs on the request goroutine, so it must not block.
 	OnDecision func(req tessaraop.Request, d tessaraop.Decision)
 
+	// AllowExplainRevealValues permits /v1/explain to echo observed attribute
+	// values instead of redacting them.
+	//
+	// Off by default. A trace shows what the request actually carried, which is
+	// what makes it useful and also what makes it sensitive — and this endpoint
+	// is reachable by anyone who can reach the PDP. Enable it for a local or
+	// staging deployment; naming individual attributes in reveal_attributes is
+	// the better answer in production, since that is an explicit and auditable
+	// choice rather than a blanket one.
+	AllowExplainRevealValues bool
+
 	// ReloadToken, when set, is required in the X-Tessaraop-Token header on
 	// /v1/reload.
 	//
@@ -146,6 +157,7 @@ func New(cfg Config) (*Server, []string, error) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/decision", s.handleDecision)
+	s.mux.HandleFunc("/v1/explain", s.handleExplain)
 	s.mux.HandleFunc("/v1/authz", s.handleForwardAuth)
 	s.mux.HandleFunc("/v1/authz/", s.handleForwardAuth)
 	s.mux.HandleFunc("/v1/data/tessaraop", s.handleOPA)
@@ -266,6 +278,83 @@ func (s *Server) evaluate(req tessaraop.Request) tessaraop.Decision {
 		s.cfg.OnDecision(req, d)
 	}
 	return d
+}
+
+// ExplainRequest is a decision request plus the knobs that control how much the
+// trace reveals.
+type ExplainRequest struct {
+	DecisionRequest
+
+	// RevealValues turns off redaction of observed attribute values.
+	//
+	// It is refused unless the server was started with
+	// Config.AllowExplainRevealValues, because a trace echoes what the request
+	// carried and this endpoint is reachable by whoever can reach the PDP. The
+	// ingest layer works hard to keep credentials out of attributes; an
+	// explanation must not undo that.
+	RevealValues bool `json:"reveal_values,omitempty"`
+
+	// RevealAttributes names individual attributes whose values may be shown
+	// even while the rest stay redacted. Always permitted: naming an attribute
+	// is an explicit, auditable choice, unlike revealing everything.
+	RevealAttributes []string `json:"reveal_attributes,omitempty"`
+
+	// IncludeOutOfScope reports policies the request could not reach, which is
+	// what you want when the surprise is that a policy did *not* apply.
+	IncludeOutOfScope bool `json:"include_out_of_scope,omitempty"`
+
+	// MaxPolicies caps the trace size. Zero uses the default.
+	MaxPolicies int `json:"max_policies,omitempty"`
+}
+
+// handleExplain answers "why?" for a request.
+//
+// It is deliberately not part of the decision path: the trace bypasses the index
+// and evaluates every in-scope rule, so it is orders of magnitude slower than
+// /v1/decision. It exists for humans and support tooling.
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	var in ExplainRequest
+	if !s.decode(w, r, &in) {
+		return
+	}
+
+	opt := tessaraop.DefaultExplainOptions()
+	opt.IncludeOutOfScope = in.IncludeOutOfScope
+	opt.MaxPolicies = in.MaxPolicies
+
+	var refused string
+	if in.RevealValues {
+		if s.cfg.AllowExplainRevealValues {
+			opt.Redact = false
+		} else {
+			refused = "reveal_values was refused: the server was not started with " +
+				"AllowExplainRevealValues. Name individual attributes in " +
+				"reveal_attributes instead."
+		}
+	}
+	if len(in.RevealAttributes) > 0 {
+		opt.RedactExcept = make(map[string]bool, len(in.RevealAttributes))
+		for _, name := range in.RevealAttributes {
+			opt.RedactExcept[name] = true
+		}
+	}
+
+	req, warnings := s.buildRequest(in.DecisionRequest)
+	if refused != "" {
+		warnings = append(warnings, refused)
+	}
+	ex := s.cfg.PDP.Explain(req, opt)
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"explanation":          ex,
+		"unmatched_attributes": ex.UnmatchedAttributes(),
+		"generation":           s.cfg.PDP.Generation(),
+		"warnings":             warnings,
+	})
 }
 
 // --- Forward-auth / ext_authz ----------------------------------------------
