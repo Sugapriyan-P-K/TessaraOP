@@ -283,7 +283,7 @@ Three security properties are enforced rather than merely documented:
 
 ## What a policy can match on
 
-118 registered attributes across the full Layer 3 / 4 / 7 surface, each with a
+117 registered attributes across the full Layer 3 / 4 / 7 surface, each with a
 declared type and the operators valid on it. Run `tessaraop -attrs` for the
 complete list, or `GET /v1/attributes` for JSON.
 
@@ -454,6 +454,7 @@ go run ./cmd/tessaraopd -bundle examples/starter-bundle.json -addr :8181
 |---|---|
 | `README.md` | This file: what it is, results, honest limitations, how to integrate |
 | `DOCUMENTATION.md` | Full architecture, algorithms, and the reasoning behind each choice |
+| `COMPARISON.md` | How Cedar / OPA / OpenFGA / Casbin work, which authorization models are supported, and what may and may not be claimed |
 | `API_REFERENCE.md` | Every exported type and function |
 | `PROGRESS.md` | Current state and what is next |
 | `rules_for_policy.md` | The source catalog of telemetry points the operator surface covers |

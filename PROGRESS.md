@@ -33,7 +33,7 @@ No external dependencies. No `go.sum`. Go 1.26.5.
 ```
 internal/
 ├── model/     types, operator semantics, condition trees, both combining tiers
-├── attr/      118-attribute L3/L4/L7 registry with type + operator validation
+├── attr/      117-attribute L3/L4/L7 registry with type + operator validation
 ├── bitset/    hybrid sparse/dense integer sets
 ├── matcher/   CIDR trie, domain trie, prefix/suffix tables, interval, numeric set
 ├── index/     sub-indexes over flattened rules, two intersection strategies
@@ -211,6 +211,25 @@ run it detached. Then update the tables in `README.md` §Measured results and
 Expect **build memory to have grown** — the rule count is roughly 2x the policy
 count now.
 
+### The five-phase roadmap
+
+`COMPARISON.md` establishes where TessaraOP sits against Cedar, OPA, OpenFGA and
+Casbin, and which authorization models are actually supported. These phases are
+ordered by the gap each closes, not by size.
+
+| Phase | Work | Gap closed |
+|---|---|---|
+| **1** | Role/group hierarchy with transitive closure, resolved at ingest | RBAC hierarchy (High) — `subject.role` is flat today |
+| **2** | `Explain` — non-short-circuiting, built on `internal/naive`, differentially tested against `Evaluate`, with attribute redaction | Cedar + OPA parity; unblocks every POC |
+| **3** | The 4 missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat |
+| **4** | ReBAC **resolver interface** + OpenFGA / SpiceDB adapters | The Critical gap, without becoming stateful |
+| **5** | BDD/MTBDD compilation → subsumption, conflict, reachability | Cedar's differentiator |
+
+Phases 1 and 4 both feed the same design: resolve facts *outside* the engine and
+hand them in as attributes. Neither touches `internal/index`, `internal/model` or
+the hot path, which is why neither risks the performance or correctness properties
+already established. `COMPARISON.md` §4 has the reasoning.
+
 ### 2. Tuple space search
 
 The identified answer to the one remaining performance limitation: a large *flat*
@@ -220,41 +239,47 @@ request's values per group. This sidesteps the non-participant inflation that
 makes the smallest available seed a large fraction of the shard.
 
 The word-parallel path already reduced this from 25x to 2.1x, so this is an
-optimization rather than a rescue.
+optimization rather than a rescue — it sits below the five phases above.
 
 ### 3. Importers from existing policy formats
 
-The user explicitly wants broad enterprise stack coverage and said they were still
-researching which. Nothing is written. The bundle format and linter are the
-migration target. Highest-value first, and each needs an honest statement of what
-does and does not translate:
+Started and then deprioritized in favour of `COMPARISON.md`.
+`internal/importer/importer.go` exists and is **untracked and unwired** — it holds
+the shared `Fidelity`/`Note`/`Report`/`Options` types, glob→operator translation,
+and the widening guard. Nothing imports it. Either finish it or delete it; do not
+leave it half-wired.
 
-- **AWS IAM** JSON policies — closest semantic fit (effect, action, resource,
-  condition), but `NotAction`/`NotResource` and variable interpolation do not map
-  cleanly.
-- **Kubernetes NetworkPolicy** — maps well onto the L3/L4 surface; label
-  selectors need a resolution step against the cluster.
-- **Envoy RBAC** — principals and permissions map onto rules; some matchers have
-  no equivalent.
-- **OPA/Rego** — general-purpose language; only a recognizable subset can be
-  translated, and claiming more would be dishonest. Note the OPA-compatible
-  *endpoint* already exists, which may be the better migration story.
+The design decision worth keeping if it is resumed: **an import must fail by
+default if any construct would widen access.** Dropping a constraint from a
+*grant* silently broadens it and the bundle still lints clean; dropping a grant
+causes a visible outage someone fixes. The two failure directions are not
+symmetric, so the default must not be either.
+
+Per-format assessment:
+
+- **AWS IAM** — closest semantic fit. `IfExists` → `Or(Not(exists), cond)` and
+  `Null` → `exists`/`nexists` translate *exactly*. Widens on `${aws:...}`
+  variables, `ForAllValues:`/`ForAnyValue:`, unknown condition keys.
+- **Kubernetes NetworkPolicy** — maps well onto L3/L4, but **its implicit
+  default-deny for selected pods must be materialized as an explicit catch-all
+  DENY**, or the import is dramatically more permissive than the source. Label
+  selectors need live cluster state.
+- **Envoy RBAC** — best structural fit; `and_rules`/`or_rules`/`not_rule` map 1:1
+  onto `And`/`Or`/`Not`. `action: ALLOW` needs the same catch-all materialization.
+- **OPA/Rego** — only a recognizable subset can be translated, and a partial
+  translator invites silent widening on what it does not understand. The
+  OPA-compatible *endpoint* is the better migration story.
 - **Cedar** — closest in spirit; `when`/`unless` map onto `And`/`Not`.
 
-### 4. Obligation union semantics
-
-Removes limitation 3 (non-canonical obligation attribution) at the cost of
-short-circuiting. Add as an opt-in `Config` field, not a default.
-
-### 5. Incremental index updates
+### 4. Incremental index updates
 
 Adding a policy rebuilds its shard. Sharding already bounds the blast radius;
-per-shard rebuild on write is the next increment.
+per-shard rebuild on write is the next increment. Matters once tenants edit
+policies live, which is after Phase 2.
 
-### 6. Smaller items
+### 5. Smaller items
 
 - Build-time memory: sub-index construction can stream rather than buffer.
-- BDD/MTBDD compilation, which would also give conflict and redundancy detection.
 - `cmd/tessaraopd` has no tests of its own; the server package is well covered but
   the flag wiring and SIGHUP path are not.
 - The linter's hostname heuristic for `suffix` is deliberately loose; it may want
@@ -280,6 +305,22 @@ Decisions already made deliberately, with the reasoning recorded in
 - **Cookie values require an allowlist.** §16.
 - **Only the AND-spine is indexable.** §9.
 
+Two further decisions recorded in `COMPARISON.md` rather than `DOCUMENTATION.md`:
+
+- **ReBAC is integrated, not built.** A Zanzibar-style tuple store requires a
+  database, which turns TessaraOP from a stateless drop-in component into a
+  stateful service and loses the zero-dependency property. Hierarchy closure (one
+  relation, transitive, no storage) is built natively in Phase 1; general
+  relationship graphs are consumed through a resolver interface with adapters, so
+  a native implementation later is a drop-in rather than a rewrite.
+  `COMPARISON.md` §7.1.
+- **No Casbin-style configurable effect expressions.** Deny-overrides can
+  short-circuit only because it is order-independent, and the index yields
+  candidates in arbitrary order. An arbitrary effect expression would force either
+  sorting every candidate set — forfeiting short-circuiting — or letting
+  enumeration order leak into decisions. Implement the remaining *standard* XACML
+  algorithms instead. `COMPARISON.md` §3.2.
+
 ---
 
 ## 8. How to verify any of this yourself
@@ -291,7 +332,7 @@ go vet ./...
 go test ./... -race                  # 316 tests (needs 64-bit gcc, see §5)
 
 go run ./cmd/tessaraop -demo         # policy walkthrough, incl. the two-tier case
-go run ./cmd/tessaraop -attrs        # the 118-attribute registry
+go run ./cmd/tessaraop -attrs        # the 117-attribute registry
 go run ./cmd/tessaraop -lint examples/starter-bundle.json
 go run ./cmd/tessaraop -n 100000 -tenants 1000 -requests 6
 go run ./cmd/tessaraopd -bundle examples/starter-bundle.json -addr :8181

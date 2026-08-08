@@ -12,7 +12,7 @@ built that way, what it measures, and what it deliberately does not do.
 | Tests | ~6,200 lines, 316 tests, passing under `-race` |
 | External dependencies | **none** — no `go.sum` |
 | Go version | built and tested on 1.26.5 |
-| Registered attributes | 118 across L3 / L4 / L7 |
+| Registered attributes | 117 across L3 / L4 / L7 |
 | Operators | 28 across 4 families, combinable with AND / OR / NOT |
 
 ---
@@ -57,7 +57,7 @@ Stated plainly, because several items are commonly assumed to be present.
 | Two-tier combining (rules within a policy, policies within a shard) | `internal/model`, `internal/index` |
 | Deny-overrides / permit-overrides / first-applicable, at both tiers | `internal/model` |
 | Obligations on decisions, attributed to the rule that fired | `internal/model` |
-| 118-attribute L3/L4/L7 registry with type and operator validation | `internal/attr` |
+| 117-attribute L3/L4/L7 registry with type and operator validation | `internal/attr` |
 | Hybrid sparse/dense integer sets | `internal/bitset` |
 | CIDR radix trie | `internal/matcher/cidr.go` |
 | DNS suffix trie (label-aligned) | `internal/matcher/domain.go` |
@@ -310,7 +310,7 @@ matters. `cmd/tessaraop -demo` demonstrates it live.
 
 ## 5. The attribute registry
 
-`internal/attr` holds 118 named attributes, each with a declared type
+`internal/attr` holds 117 named attributes, each with a declared type
 (`string` / `numeric` / `ip`), a layer, documentation, and the operators valid on
 it.
 
