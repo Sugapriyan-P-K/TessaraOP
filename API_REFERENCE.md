@@ -12,6 +12,7 @@ Go go1.26.5 | 2026-08-15
 - [`pkg/tessaraop/audit`](#pkg-tessaraop-audit) - Structured decision audit records.
 - [`pkg/tessaraop/openfga`](#pkg-tessaraop-openfga) - Relationship resolver backed by an OpenFGA server.
 - [`internal/analyze`](#internal-analyze) - BDD-based policy analysis: unreachable, shadowed, duplicate, conflicting rules.
+- [`internal/importer`](#internal-importer) - Translators from AWS IAM, Kubernetes NetworkPolicy and Envoy RBAC.
 - [`internal/model`](#internal-model) - Core types, operator semantics, condition trees, both combining tiers.
 - [`internal/attr`](#internal-attr) - The L3/L4/L7 attribute registry.
 - [`internal/explain`](#internal-explain) - Per-condition answers to why a decision came out as it did.
@@ -216,6 +217,18 @@ var ErrHierarchyCycle = hierarchy.ErrCycle
     ErrHierarchyCycle is reported when a membership graph is not acyclic.
     A cycle is always an authoring mistake, and tolerating one would make a
     principal's effective roles depend on traversal order.
+
+var ErrImportWidensAccess = importer.ErrWidensAccess
+    ErrImportWidensAccess reports that a translation would accept something the
+    source policy refused.
+
+    This is the error that matters. Most policy languages express constraints
+    as restrictions on a grant, so a dropped constraint *broadens* the result
+    — the translation succeeds, the bundle lints clean, and access is quietly
+    wider than what it replaced. The reverse mistake produces an outage somebody
+    notices and fixes. The two directions are not symmetric, so an import fails
+    by default rather than succeeding quietly, and ImportOptions.AllowWidening
+    is the explicit acceptance.
 
 var ErrNoPolicies = errors.New("tessaraop: policy set is empty")
     ErrNoPolicies is returned when a load would leave the PDP with nothing.
@@ -424,6 +437,44 @@ func HierarchyFromMap(m map[string][]string) (*Hierarchy, error)
 func NewHierarchy() *Hierarchy
     NewHierarchy returns an empty, unfrozen membership graph. Call Add to record
     that a child is subsumed by its parents, then Freeze.
+
+type ImportNote = importer.Note
+    ImportNote is one observation about one source construct.
+
+type ImportOptions = importer.Options
+    ImportOptions controls a translation.
+
+type ImportReport = importer.Report
+    ImportReport describes what a translation preserved, approximated and
+    dropped.
+
+type ImportResult = importer.Result
+    ImportResult is a completed translation: the policies plus a report of how
+    faithfully each source construct survived.
+
+func ImportAWSIAM(r io.Reader, source string, opt ImportOptions) (*ImportResult, error)
+    ImportAWSIAM translates an AWS IAM policy document.
+
+    Statements become rules under deny-overrides, which is IAM's
+    explicit-deny-wins exactly. `IfExists` and `Null` translate perfectly;
+    policy variables, set operators and unrecognised condition keys do not,
+    and are reported as widening.
+
+func ImportEnvoyRBAC(r io.Reader, source string, opt ImportOptions) (*ImportResult, error)
+    ImportEnvoyRBAC translates an Envoy RBAC filter configuration.
+
+    Envoy's and_rules / or_rules / not_rule map onto And / Or / Not directly,
+    so the boolean shape survives intact. `shadow_rules` are deliberately not
+    enforced.
+
+func ImportK8sNetworkPolicy(r io.Reader, source string, opt ImportOptions) (*ImportResult, error)
+    ImportK8sNetworkPolicy translates Kubernetes NetworkPolicy objects,
+    as produced by `kubectl get networkpolicy -o json`.
+
+    The namespace becomes the tenant unless overridden. NetworkPolicy's implicit
+    default-deny is materialized as an explicit lowest-priority rule, without
+    which the import would permit traffic the source refused. Label selectors
+    need live cluster state and are reported as widening.
 
 type Info struct {
 	Generation      uint64 `json:"generation"`
@@ -1339,6 +1390,197 @@ const (
 	Error
 )
 func (s Severity) String() string
+
+```
+
+---
+
+## internal/importer
+
+Translators from AWS IAM, Kubernetes NetworkPolicy and Envoy RBAC.
+
+```go
+package importer // import "github.com/suga/tessaraop/internal/importer"
+
+Package importer translates policies from other engines into TessaraOP bundles.
+
+# The failure mode this package is built around
+
+A translator that cannot express a construct has two options: drop it,
+or refuse. Dropping is almost always wrong here, and the reason is asymmetric.
+
+Most policy languages express constraints as *restrictions* on a grant.
+An AWS IAM statement that allows `s3:GetObject` only when `aws:SourceIp` is
+inside 10.0.0.0/8 becomes, if the condition is dropped, a statement that allows
+`s3:GetObject` from anywhere. The translation succeeded, the bundle lints clean,
+and access is now broader than the policy it replaced. Nobody notices until it
+matters.
+
+The reverse — dropping something that would have *granted* access — produces a
+policy that denies too much. That is a visible outage, someone files a ticket,
+and it gets fixed.
+
+So every note this package emits carries a Widens flag, and by default an import
+**fails** if any construct would widen access. Options.AllowWidening exists
+for the case where an operator has read the notes and accepted them, and it is
+deliberately not the default.
+
+# What "fidelity" means here
+
+    Exact         semantics preserved; the translated rule accepts exactly what
+                  the source accepted
+    Approximated  preserved with a caveat the operator must read — usually
+                  because the source referred to something only its own runtime
+                  can resolve, and the translation depends on the request
+                  supplying an equivalent attribute
+    Dropped       not translated at all
+
+# Formats
+
+All three importers read JSON, because this module has no dependencies and
+the standard library ships no YAML codec. Every source format has a JSON form
+reachable from its own tooling:
+
+    AWS IAM              aws iam get-policy-version --output json
+    Kubernetes NetPol    kubectl get networkpolicy -o json
+    Envoy RBAC           the rbac filter config from a config dump
+
+# What is deliberately not attempted
+
+Rego is a general-purpose language with negation-as-failure, comprehensions
+and arbitrary built-ins. Only a recognizable subset could be translated,
+and shipping a partial Rego translator invites exactly the silent-widening
+failure above on the cases it does not understand. The OPA-compatible *endpoint*
+in package pdpserver is the better migration path: it keeps the caller's client
+code and lets policies be rewritten deliberately rather than machine-guessed.
+
+CONSTANTS
+
+const K8sLabelAttribute = "k8s.pod_labels"
+    K8sLabelAttribute is where a pod's labels are expected, as comma-joined
+    "key=value" pairs. Match with has_all.
+
+const K8sNamespaceAttribute = "k8s.namespace"
+    K8sNamespaceAttribute is where the workload's namespace is expected.
+
+
+VARIABLES
+
+var (
+	// ErrWidensAccess means the translation would accept something the source
+	// policy refused. See Report.Widening() for what and why.
+	ErrWidensAccess = errors.New("importer: translation would widen access")
+
+	// ErrApproximated is returned under Options.Strict when any construct could
+	// only be approximated.
+	ErrApproximated = errors.New("importer: translation is approximate")
+
+	// ErrNoTenant means Options.Tenant was empty.
+	ErrNoTenant = errors.New("importer: Options.Tenant is required")
+)
+    Errors returned when a translation cannot be delivered safely.
+
+
+TYPES
+
+type Fidelity uint8
+    Fidelity records how faithfully one source construct was translated.
+
+const (
+	// Exact: the translated rule accepts exactly what the source accepted.
+	Exact Fidelity = iota
+	// Approximated: preserved, but the operator must read the note.
+	Approximated
+	// Dropped: not translated.
+	Dropped
+)
+func (f Fidelity) String() string
+
+type Note struct {
+	Fidelity Fidelity
+	// Path locates the construct in the source document, e.g.
+	// Statement[2].Condition.StringLike.
+	Path string
+	// Source names the construct, e.g. "NotAction" or "podSelector".
+	Source string
+	// Message explains what happened and, when relevant, what the operator
+	// should do about it.
+	Message string
+	// Widens reports whether this translation makes the resulting policy accept
+	// something the source policy would have refused. These are the notes that
+	// matter: see the package documentation.
+	Widens bool
+}
+    Note is one observation about the translation of one source construct.
+
+func (n Note) String() string
+
+type Options struct {
+	// Tenant is the tenant the imported policies belong to. Required: an
+	// imported policy with no tenant would land in the global shard and apply to
+	// every request in the deployment, which is never what a translation of one
+	// customer's policy means.
+	Tenant string
+
+	// Scope subdivides the tenant. Each importer supplies a sensible default
+	// when this is empty — "network" for NetworkPolicy, for instance — because
+	// leaving everything at tenant-wide scope forfeits the partitioning that
+	// makes evaluation fast.
+	Scope string
+
+	// IDPrefix is prepended to generated policy and rule IDs, so several imports
+	// into one bundle cannot collide.
+	IDPrefix string
+
+	// AllowWidening permits an import whose result accepts more than the source.
+	// Off by default. Turn it on only after reading Report.Widening().
+	AllowWidening bool
+
+	// Strict additionally refuses an import with any Approximated note, for a
+	// pipeline that wants byte-for-byte semantics or nothing.
+	Strict bool
+}
+    Options controls an import.
+
+type Report struct {
+	Format   string
+	Source   string // a name for the document, e.g. its filename
+	Policies int
+	Rules    int
+	Notes    []Note
+}
+    Report summarizes an import.
+
+func (r *Report) ByFidelity() map[Fidelity]int
+    ByFidelity counts notes at each fidelity level.
+
+func (r *Report) String() string
+    String renders the report for a terminal or a CI log, widening notes first.
+
+func (r *Report) Widening() []Note
+    Widening returns the notes whose translation broadens access. An operator
+    should read these before shipping the result, and by default the import
+    refuses to produce policies while any exist.
+
+type Result struct {
+	Policies []model.Policy
+	Report   Report
+}
+    Result is a completed import.
+
+func ImportAWSIAM(r io.Reader, source string, opt Options) (*Result, error)
+    ImportAWSIAM translates an IAM policy document.
+
+func ImportEnvoyRBAC(r io.Reader, source string, opt Options) (*Result, error)
+    ImportEnvoyRBAC translates an Envoy RBAC configuration.
+
+func ImportK8sNetworkPolicy(r io.Reader, source string, opt Options) (*Result, error)
+    ImportK8sNetworkPolicy translates one or more NetworkPolicy objects.
+
+    The namespace becomes the tenant unless Options.Tenant overrides it,
+    because in multi-tenant Kubernetes the namespace *is* the tenant boundary.
+    A policy imported into the wrong tenant would apply to traffic it was never
+    written for.
 
 ```
 
