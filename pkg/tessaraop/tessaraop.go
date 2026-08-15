@@ -57,6 +57,7 @@ import (
 	"github.com/suga/tessaraop/internal/engine"
 	"github.com/suga/tessaraop/internal/explain"
 	"github.com/suga/tessaraop/internal/hierarchy"
+	"github.com/suga/tessaraop/internal/importer"
 	"github.com/suga/tessaraop/internal/model"
 	"github.com/suga/tessaraop/internal/relation"
 )
@@ -658,6 +659,61 @@ func HierarchyFromMap(m map[string][]string) (*Hierarchy, error) {
 // is always an authoring mistake, and tolerating one would make a principal's
 // effective roles depend on traversal order.
 var ErrHierarchyCycle = hierarchy.ErrCycle
+
+// --- Importing from other policy formats -------------------------------------
+
+// ImportResult is a completed translation: the policies plus a report of how
+// faithfully each source construct survived.
+type ImportResult = importer.Result
+
+// ImportReport describes what a translation preserved, approximated and dropped.
+type ImportReport = importer.Report
+
+// ImportNote is one observation about one source construct.
+type ImportNote = importer.Note
+
+// ImportOptions controls a translation.
+type ImportOptions = importer.Options
+
+// ErrImportWidensAccess reports that a translation would accept something the
+// source policy refused.
+//
+// This is the error that matters. Most policy languages express constraints as
+// restrictions on a grant, so a dropped constraint *broadens* the result — the
+// translation succeeds, the bundle lints clean, and access is quietly wider than
+// what it replaced. The reverse mistake produces an outage somebody notices and
+// fixes. The two directions are not symmetric, so an import fails by default
+// rather than succeeding quietly, and ImportOptions.AllowWidening is the explicit
+// acceptance.
+var ErrImportWidensAccess = importer.ErrWidensAccess
+
+// ImportAWSIAM translates an AWS IAM policy document.
+//
+// Statements become rules under deny-overrides, which is IAM's explicit-deny-wins
+// exactly. `IfExists` and `Null` translate perfectly; policy variables, set
+// operators and unrecognised condition keys do not, and are reported as widening.
+func ImportAWSIAM(r io.Reader, source string, opt ImportOptions) (*ImportResult, error) {
+	return importer.ImportAWSIAM(r, source, opt)
+}
+
+// ImportK8sNetworkPolicy translates Kubernetes NetworkPolicy objects, as produced
+// by `kubectl get networkpolicy -o json`.
+//
+// The namespace becomes the tenant unless overridden. NetworkPolicy's implicit
+// default-deny is materialized as an explicit lowest-priority rule, without which
+// the import would permit traffic the source refused. Label selectors need live
+// cluster state and are reported as widening.
+func ImportK8sNetworkPolicy(r io.Reader, source string, opt ImportOptions) (*ImportResult, error) {
+	return importer.ImportK8sNetworkPolicy(r, source, opt)
+}
+
+// ImportEnvoyRBAC translates an Envoy RBAC filter configuration.
+//
+// Envoy's and_rules / or_rules / not_rule map onto And / Or / Not directly, so the
+// boolean shape survives intact. `shadow_rules` are deliberately not enforced.
+func ImportEnvoyRBAC(r io.Reader, source string, opt ImportOptions) (*ImportResult, error) {
+	return importer.ImportEnvoyRBAC(r, source, opt)
+}
 
 // --- Static analysis --------------------------------------------------------
 

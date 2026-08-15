@@ -2,19 +2,23 @@
 //
 //	-demo          walk a hand-written policy set covering every operator family
 //	-attrs         print the attribute registry an integration must populate
-//	-lint FILE     validate a policy bundle; non-zero exit if it has errors
+//	-lint FILE     validate and analyse a policy bundle; non-zero exit on errors
 //	-export        write the demo policy set as a starter bundle on stdout
+//	-import FORMAT translate a policy file from AWS IAM, Kubernetes NetworkPolicy
+//	               or Envoy RBAC; bundle on stdout, fidelity report on stderr
 //	-interactive   type request attributes and see decisions
 //	(default)      generate a corpus and compare naive against the engine
 package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,8 +53,27 @@ func main() {
 			"with -lint, reject attributes outside the registry")
 		export = flag.Bool("export", false,
 			"write the demo policy set as a starter bundle on stdout and exit")
+		importFormat = flag.String("import", "",
+			"translate a policy file: aws-iam | k8s-networkpolicy | envoy-rbac")
+		importFile = flag.String("import-file", "",
+			"the file to translate with -import")
+		importTenant = flag.String("import-tenant", "",
+			"tenant for imported policies (NetworkPolicy defaults to the namespace)")
+		importScope = flag.String("import-scope", "",
+			"scope for imported policies")
+		allowWidening = flag.Bool("allow-widening", false,
+			"permit an import whose result accepts more than the source did; "+
+				"read the report before setting this")
 	)
 	flag.Parse()
+
+	if *importFormat != "" {
+		os.Exit(runImport(*importFormat, *importFile, tessaraop.ImportOptions{
+			Tenant:        *importTenant,
+			Scope:         *importScope,
+			AllowWidening: *allowWidening,
+		}))
+	}
 
 	if *attrs {
 		printRegistry()
@@ -139,6 +162,75 @@ func printExplanation(policies []model.Policy, req model.Request, alg model.Algo
 			}
 		}
 	}
+}
+
+// runImport translates a policy file from another engine and writes a bundle on
+// stdout, with the fidelity report on stderr so the two can be separated.
+//
+// A translation that would broaden access exits non-zero without emitting a
+// bundle, unless -allow-widening says the operator has read the report and
+// accepted it. Silently producing a more permissive policy set is the failure
+// this whole path is designed around.
+func runImport(format, path string, opt tessaraop.ImportOptions) int {
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "-import requires -import-file")
+		return 2
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot read %s: %v\n", path, err)
+		return 1
+	}
+	defer f.Close()
+
+	name := filepath.Base(path)
+	var res *tessaraop.ImportResult
+	switch format {
+	case "aws-iam":
+		res, err = tessaraop.ImportAWSIAM(f, name, opt)
+	case "k8s-networkpolicy":
+		res, err = tessaraop.ImportK8sNetworkPolicy(f, name, opt)
+	case "envoy-rbac":
+		res, err = tessaraop.ImportEnvoyRBAC(f, name, opt)
+	default:
+		fmt.Fprintf(os.Stderr,
+			"unknown format %q; valid values are aws-iam, k8s-networkpolicy, envoy-rbac\n",
+			format)
+		return 2
+	}
+
+	// The report goes to stderr whether or not the import succeeded, because it
+	// is what the operator needs in order to decide about -allow-widening.
+	if res != nil {
+		fmt.Fprint(os.Stderr, res.Report.String())
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nimport failed: %v\n", err)
+		if errors.Is(err, tessaraop.ErrImportWidensAccess) {
+			fmt.Fprintln(os.Stderr,
+				"Review the WIDENING ACCESS notes above. Each one is a construct whose\n"+
+					"loss makes the result accept something the source refused. Fix the\n"+
+					"source, or pass -allow-widening once you have accepted them.")
+		}
+		return 1
+	}
+
+	if err := tessaraop.ExportBundle(res.Policies, os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "writing bundle: %v\n", err)
+		return 1
+	}
+
+	// Lint and analyse what was produced, so a translation that is faithful but
+	// nonsensical is caught here rather than at deploy time.
+	diags := tessaraop.ValidatePolicies(res.Policies, tessaraop.LintOptions{})
+	for _, d := range diags {
+		fmt.Fprintf(os.Stderr, "%s\n", d)
+	}
+	if tessaraop.HasErrors(diags) {
+		fmt.Fprintln(os.Stderr, "\nthe translated bundle does not lint cleanly")
+		return 1
+	}
+	return 0
 }
 
 // runLint validates a bundle and reports findings, returning the process exit
