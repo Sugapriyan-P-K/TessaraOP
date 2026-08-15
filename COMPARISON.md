@@ -347,8 +347,16 @@ elements, and the linter now rejects `contains` on any registered set attribute.
 | No delta bundles or discovery API | Medium | OPA |
 | No entity type schema | Medium | Cedar |
 | No `ListObjects` over relationships | Medium | OpenFGA, SpiceDB |
-| No importers from other policy formats | Medium | — |
+| No Cedar or Rego importer | Low | — |
 | No SMT-backed equivalence or formal semantics proof | Low | Cedar |
+
+Rego is deliberately not on the importer list. It is a general-purpose language
+with negation-as-failure, comprehensions and arbitrary built-ins; only a
+recognizable subset could be translated, and a partial translator invites exactly
+the silent-widening failure the importer package is built to prevent on the cases
+it does not understand. The OPA-compatible *endpoint* is the better migration
+path — it keeps the caller's client code and lets policies be rewritten
+deliberately rather than machine-guessed.
 
 `ListObjects` — *"which documents can Anne view"* — is a reverse query over the
 relationship graph rather than a predicate evaluation, and is explicitly out of
@@ -386,7 +394,7 @@ axis instead of TessaraOP's own.
 | **3** | The missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat | **Done** (6 of 8) |
 | **4** | ReBAC **resolver interface** + adapters | Critical gap, without becoming stateful | **Interface done**; adapters not written |
 | **5** | BDD compilation → unreachability, shadowing, duplicates, conflicts | Cedar's differentiator | **Done** |
-| **6** | Importers from other policy formats | Migration | Not started |
+| **6** | Importers from other policy formats | Migration | **Done** — AWS IAM, Kubernetes NetworkPolicy, Envoy RBAC |
 
 Phase 4 shipped the interface, an in-memory implementation, composition
 (chaining, timeouts, TTL caching), and **an OpenFGA adapter verified against a

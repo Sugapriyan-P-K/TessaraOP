@@ -375,7 +375,43 @@ outside the trust boundary of the service that wrote them. Writes go through a
 bounded buffer: if the sink stalls, records drop and the drop is counted, because
 a decision that cannot be logged must still be *made*.
 
-### 8. Ingestion adapters — `internal/ingest`
+### 8. Importers — read what the customer already has
+
+Nobody adopts an authorization engine by rewriting their policies first.
+
+```bash
+tessaraop -import aws-iam -import-file policy.json -import-tenant acme > bundle.json
+```
+
+| Source | Fit |
+|---|---|
+| **AWS IAM** | Closest. A statement is already an effect plus a conjunction, and explicit-deny-wins *is* deny-overrides. `IfExists` and `Null` translate exactly. |
+| **Kubernetes NetworkPolicy** | `kubectl get netpol -o json`. Namespace becomes the tenant; `ipBlock.except` translates exactly. |
+| **Envoy RBAC** | Best structural fit — `and_rules`/`or_rules`/`not_rule` map 1:1 onto `And`/`Or`/`Not`, and `safe_regex` is RE2 like ours, so patterns transfer unchanged. |
+
+**An import fails by default if it would widen access**, and that asymmetry is
+the whole design. Most policy languages express constraints as *restrictions on a
+grant*: drop the `IpAddress` condition from an IAM statement and it now allows
+the action from anywhere — translation succeeded, bundle lints clean, access is
+silently broader. Drop something that *granted* access and you get a visible
+outage somebody fixes. The two directions are not symmetric, so every note
+carries a `Widens` flag and `-allow-widening` is an explicit, informed override.
+
+```
+aws-iam import of policy.json: 1 policies, 2 rules
+  4 exact, 1 approximated, 1 dropped, 1 WIDENING ACCESS
+  WIDENS ACCESS (dropped): Statement[0].Resource: value "arn:aws:s3:::b/${aws:username}/*"
+    contains a policy variable, which resolves at evaluation time and cannot be
+    translated statically
+```
+
+Two cases worth knowing: **NetworkPolicy's implicit default-deny is materialized**
+as an explicit lowest-priority rule — the shard-level default is *not* equivalent,
+since another policy could grant what the source refused. And **Envoy's
+`shadow_rules` are deliberately not enforced**, because they're its dry-run
+mechanism; folding them in would turn an observation into a denial.
+
+### 9. Ingestion adapters — `internal/ingest`
 
 Builds a request from `*http.Request`, `net.Conn`, `*tls.ConnectionState` and your
 own token/subject verdicts, using only standard-library parsers. Parser-differential
@@ -605,9 +641,16 @@ Named explicitly so the roadmap is not confused with the codebase:
 - **RoaringBitmap** — not used; `internal/bitset` borrows the "pick representation
   by cardinality" idea without being Roaring
 - **Incremental index updates** — adding a policy rebuilds its shard
-- **Importers from other formats** (AWS IAM, Kubernetes NetworkPolicy, Envoy RBAC,
-  Cedar, Rego) — the bundle format and linter are the migration target, but no
-  translator is written
+- **Cedar and Rego importers** — AWS IAM, Kubernetes NetworkPolicy and Envoy RBAC
+  are implemented; Rego is a general-purpose language where only a recognizable
+  subset could be translated, and a partial translator invites silent widening on
+  the cases it does not understand
+- **SpiceDB adapter** — the OpenFGA one is written and verified; SpiceDB's is not
+- **`ListObjects` over relationships** — a reverse query over the relationship
+  graph, which is the ReBAC store's job rather than a predicate evaluator's
+- **SMT-backed equivalence or a machine-checked semantics** — there is BDD
+  analysis for unreachability, shadowing, duplicates and conflicts, but Cedar's
+  formal-verification story is genuinely deeper
 - **gRPC** — the HTTP forward-auth shape covers the same proxies without a
   protobuf dependency
 - **YAML authoring** — JSON only, to keep the dependency count at zero; convert at

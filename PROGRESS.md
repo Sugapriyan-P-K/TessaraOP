@@ -228,9 +228,10 @@ ordered by the gap each closes, not by size.
 | **3** | The missing XACML algorithms + obligation union | **Done** — 6 of 8 |
 | **4** | ReBAC resolver interface + adapters | **Done** — interface, in-memory, and an OpenFGA adapter verified against a live server |
 | **5** | BDD compilation → unreachable, shadowed, duplicate, conflict | **Done** — `internal/analyze` |
-| **6** | Importers from other policy formats | Not started |
+| **6** | Importers from other policy formats | **Done** — AWS IAM, K8s NetworkPolicy, Envoy RBAC |
 
-All five phases are complete. What remains is §6 below.
+**Every roadmap phase is complete.** What remains is listed below, and none of it
+is blocking.
 
 Phases 1 and 4 both feed the same design: resolve facts *outside* the engine and
 hand them in as attributes. Neither touches `internal/index`, `internal/model` or
@@ -248,35 +249,21 @@ makes the smallest available seed a large fraction of the shard.
 The word-parallel path already reduced this from 25x to 2.1x, so this is an
 optimization rather than a rescue — it sits below the five phases above.
 
-### 3. Importers from existing policy formats
+### 3. Remaining importers
 
-Started and then deprioritized in favour of `COMPARISON.md`.
-`internal/importer/importer.go` exists and is **untracked and unwired** — it holds
-the shared `Fidelity`/`Note`/`Report`/`Options` types, glob→operator translation,
-and the widening guard. Nothing imports it. Either finish it or delete it; do not
-leave it half-wired.
+AWS IAM, Kubernetes NetworkPolicy and Envoy RBAC are implemented and tested in
+`internal/importer`. Two are deliberately absent:
 
-The design decision worth keeping if it is resumed: **an import must fail by
-default if any construct would widen access.** Dropping a constraint from a
-*grant* silently broadens it and the bundle still lints clean; dropping a grant
-causes a visible outage someone fixes. The two failure directions are not
-symmetric, so the default must not be either.
+- **Rego** — a general-purpose language with negation-as-failure, comprehensions
+  and arbitrary built-ins. Only a recognizable subset could be translated, and a
+  partial translator invites silent widening on the cases it does not understand.
+  The OPA-compatible *endpoint* is the better migration path.
+- **Cedar** — closest in spirit (`when`/`unless` map onto `And`/`Not`) and the
+  most plausible next one. It needs a parser for the Cedar DSL, which is the only
+  reason it is not done.
 
-Per-format assessment:
-
-- **AWS IAM** — closest semantic fit. `IfExists` → `Or(Not(exists), cond)` and
-  `Null` → `exists`/`nexists` translate *exactly*. Widens on `${aws:...}`
-  variables, `ForAllValues:`/`ForAnyValue:`, unknown condition keys.
-- **Kubernetes NetworkPolicy** — maps well onto L3/L4, but **its implicit
-  default-deny for selected pods must be materialized as an explicit catch-all
-  DENY**, or the import is dramatically more permissive than the source. Label
-  selectors need live cluster state.
-- **Envoy RBAC** — best structural fit; `and_rules`/`or_rules`/`not_rule` map 1:1
-  onto `And`/`Or`/`Not`. `action: ALLOW` needs the same catch-all materialization.
-- **OPA/Rego** — only a recognizable subset can be translated, and a partial
-  translator invites silent widening on what it does not understand. The
-  OPA-compatible *endpoint* is the better migration story.
-- **Cedar** — closest in spirit; `when`/`unless` map onto `And`/`Not`.
+If either is resumed, the rule to keep is the one the package is built around:
+**an import must fail by default if any construct would widen access.**
 
 ### 4. Incremental index updates
 
