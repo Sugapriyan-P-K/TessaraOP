@@ -51,6 +51,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/suga/tessaraop/internal/analyze"
 	"github.com/suga/tessaraop/internal/attr"
 	"github.com/suga/tessaraop/internal/bundle"
 	"github.com/suga/tessaraop/internal/engine"
@@ -657,6 +658,46 @@ func HierarchyFromMap(m map[string][]string) (*Hierarchy, error) {
 // is always an authoring mistake, and tolerating one would make a principal's
 // effective roles depend on traversal order.
 var ErrHierarchyCycle = hierarchy.ErrCycle
+
+// --- Static analysis --------------------------------------------------------
+
+// AnalysisReport lists policy defects found without running any request.
+type AnalysisReport = analyze.Report
+
+// AnalysisFinding is one defect.
+type AnalysisFinding = analyze.Finding
+
+// AnalysisOptions tunes an analysis.
+type AnalysisOptions = analyze.Options
+
+// DefaultAnalysisOptions reports unreachable rules, shadowing, duplicates and
+// conflicts within each policy.
+func DefaultAnalysisOptions() AnalysisOptions { return analyze.DefaultOptions() }
+
+// Analyze finds defects that testing cannot: rules whose conditions contradict
+// so they can never fire, rules already covered by another with the same effect,
+// duplicates, and pairs with opposite effects that can both match.
+//
+// These are questions about *every possible request*, not one request, so they
+// are decided by compiling conditions to a binary decision diagram rather than by
+// sampling. An unreachable rule stays unreachable no matter how many tests pass.
+//
+// It is an authoring and CI tool. Rules are compared pairwise within a shard, so
+// cost grows quadratically with shard size, and both that and the diagram size
+// are bounded — past the bounds a finding says the analysis was partial rather
+// than reporting a guess.
+//
+// The underlying theory is deliberately incomplete, and the incompleteness is
+// biased safely: it can report a conflict that cannot really occur, but it will
+// not call a live rule unreachable or a needed rule redundant.
+func Analyze(policies []Policy, opt AnalysisOptions) *AnalysisReport {
+	return analyze.Analyze(policies, opt)
+}
+
+// AnalyzeInstalled analyses whatever policy set this PDP currently holds.
+func (p *PDP) AnalyzeInstalled(opt AnalysisOptions) *AnalysisReport {
+	return analyze.Analyze(p.Policies(), opt)
+}
 
 // --- Relationships (ReBAC) --------------------------------------------------
 

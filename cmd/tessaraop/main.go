@@ -175,11 +175,35 @@ func runLint(path string, strict bool) int {
 		fmt.Printf("  attributes used:  %d\n", len(s.Attributes))
 	}
 
+	// Static analysis: defects no amount of testing would find, because they are
+	// claims about every possible request rather than about one.
+	if b, rerr := bundle.ReadFile(path); rerr == nil {
+		if policies, _, cerr := b.Compile(tessaraop.LintOptions{}); cerr == nil {
+			printAnalysis(policies)
+		}
+	}
+
 	fmt.Printf("\n%d error(s), %d warning(s)\n", len(errs), len(diags)-len(errs))
 	if len(errs) > 0 {
 		return 1
 	}
 	return 0
+}
+
+// printAnalysis reports unreachable, shadowed, duplicate and conflicting rules.
+func printAnalysis(policies []model.Policy) {
+	report := tessaraop.Analyze(policies, tessaraop.DefaultAnalysisOptions())
+	if len(report.Findings) == 0 {
+		fmt.Printf("\nAnalysis: no unreachable, shadowed, duplicate or conflicting rules "+
+			"across %d shards\n", report.Shards)
+		return
+	}
+
+	fmt.Printf("\nAnalysis (%d rules across %d shards, %d atoms, %d BDD nodes)\n",
+		report.RulesAnalysed, report.Shards, report.AtomsDerived, report.BDDNodes)
+	for _, f := range report.Findings {
+		fmt.Printf("  %s\n", f)
+	}
 }
 
 // printRegistry lists every attribute an ingestion adapter is expected to
