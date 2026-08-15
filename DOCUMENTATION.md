@@ -41,6 +41,7 @@ built that way, what it measures, and what it deliberately does not do.
 19. [Performance](#19-performance)
 20. [Limitations](#20-limitations)
 21. [Roadmap](#21-roadmap)
+22. [Static analysis](#22-static-analysis)
 
 ---
 
@@ -1179,3 +1180,126 @@ mostly signatures gets pruning only from attribute presence.
 7. **Obligation union semantics** — an option to collect obligations from every
    matching same-effect rule rather than only the credited one, which would remove
    limitation 3 at the cost of short-circuiting.
+
+---
+
+## 22. Static analysis
+
+`internal/analyze` answers questions about **every possible request** rather than
+about one: can this rule ever fire, is it already covered by another, can these
+two contradict each other. Those quantify over an infinite request space, so no
+number of passing tests settles them.
+
+### 22.1 Why a BDD
+
+A reduced ordered binary decision diagram represents a boolean function
+*canonically*. Two functions are equal exactly when their root nodes are the same
+node, which collapses the interesting questions into pointer comparisons:
+
+| Question | Becomes |
+|---|---|
+| Can this rule ever fire? | Is its node ≠ the false terminal |
+| Does A subsume B? | Is `A ∧ ¬B` the false terminal |
+| Are these identical? | Are the two node IDs equal |
+| Does it always fire? | Is its node the true terminal |
+
+No search, no enumeration over attribute values — which is essential, because that
+space is infinite for numerics and effectively so for strings.
+
+*Reduced* and *ordered* are what buy canonicity, and both are enforced in `mk`: a
+node whose branches are identical is replaced by that branch, and structurally
+identical nodes are shared through a unique table rather than duplicated.
+
+### 22.2 The theory is the hard part, not the BDD
+
+Mapping each predicate to an independent boolean variable is the obvious move and
+it produces nonsense. `subject.role == "admin"` and `subject.role == "viewer"`
+would be unrelated variables, so a rule requiring both would look satisfiable and
+**every mutually exclusive pair of rules would be reported as a conflict.** The
+tool would be pure noise.
+
+So atoms carry derived relations, conjoined with every query:
+
+| Technique | Decides |
+|---|---|
+| **Finite-domain evaluation** | Anything where one side admits finitely many values (`eq`, `in`, `num_eq`, `num_in`): each value is tested against the other predicate using `Condition.Matches` |
+| Interval arithmetic | `range`, `gt`, `gte`, `lt`, `lte`, `num_eq`, `num_ne`, `nrange`, `num_in` |
+| Prefix containment | `cidr` nesting and disjointness |
+| Affix nesting | `prefix`, `suffix`, `dnssuffix` |
+| Set algebra | `has_all` ⇒ `has_any`, `has_any` excludes `has_none` |
+
+The finite-domain technique is the strongest and also the simplest. It is exact,
+it decides pairs no structural rule could — including anything involving `regex`
+or `contains`, which are otherwise opaque — and because it calls the engine's own
+matcher, **the analyser cannot drift from what the evaluator actually does.**
+
+### 22.3 The presence variable
+
+Each attribute gets a synthetic "is present" variable, and every value atom
+implies it. `exists` *is* that variable; `nexists` is its negation.
+
+Without it the fail-closed semantics come out wrong. The engine requires an
+attribute for every operator except `nexists`, so `role == "admin"` and
+`role != "admin"` are **both false** on a request carrying no role. Treated as
+plain booleans they would look like complements, and the analyser would conclude
+one of them must always hold.
+
+### 22.4 Soundness direction
+
+The theory is deliberately incomplete: when nothing can be derived about two
+predicates, they are independent. That biases every result in one direction.
+
+```
+Under-constrained ⇒ the analyser believes more is possible than really is.
+  · may report a Conflict that cannot occur          (false alarm)
+  · will NOT report Unreachable for a live rule      (safe)
+  · will NOT report Shadowed for a needed rule       (safe)
+```
+
+**False alarms, never false reassurance, and never advice to delete a rule that is
+doing something.** That asymmetry is what makes the output safe to act on, and it
+is pinned by `TestReachable_NoFalsePositives` plus a sampling cross-check against
+a generated corpus.
+
+### 22.5 Three bugs worth recording
+
+All three were caught by the tests, and each is the kind that would have made the
+tool actively harmful.
+
+**The node budget poisoned the constraint set.** `mk` returns `bddFalse` alongside
+its error when the budget is exhausted, and `bddFalse` is a perfectly valid node —
+so assigning the result before checking the error set the shard's constraints to
+*false*, which made every rule in that shard report as unreachable. The worst
+possible wrong answer: it tells an operator to delete working rules. Constraint
+updates are now transactional, and a dropped clause marks the theory degraded,
+leaving it under-constrained rather than contradictory.
+
+**Variable ordering caused that exhaustion.** Variables were numbered in the order
+conditions happened to be encountered, scattering each attribute's exclusion
+clauses across the whole diagram. Registering conditions up front and grouping
+variables by attribute took a shard from blowing a million-node budget to
+finishing in a few thousand, and the corpus test from 49 seconds to under two.
+
+**Exclusions were derived in one direction only.** `eq "/public/docs"` excludes
+`regex "^/admin/"` because the one possible value fails the pattern; the reverse
+comparison has no finite domain to test and yields nothing. Checking only forward
+silently dropped those exclusions. Both directions are now evaluated.
+
+### 22.6 Cost and bounds
+
+This is an authoring and CI tool, not a request-path one. Rules are compared
+pairwise **within a shard** — the only set a single request can reach — so cost is
+quadratic in shard size. Two bounds keep a run finite:
+
+- `MaxNodes` caps the diagram. Past it, a rule is reported as `too-complex` rather
+  than analysed. Refusing to answer is acceptable; hanging in CI is not.
+- `MaxRulesPerShard` caps pairwise work. Past it the linear findings
+  (`unreachable`, `always-matches`) are still produced and the pairwise ones are
+  skipped with a finding saying so, rather than silently omitted.
+
+### 22.7 What it is not
+
+There is no SMT solver, no machine-checked formal semantics, and no
+whole-policy-set equivalence checking. Cedar has all three. This answers the four
+questions a policy author actually asks, with its incompleteness documented and
+biased safely — "analysable" is a fair description, "formally verified" is not.

@@ -10,6 +10,8 @@ Go go1.26.5 | 2026-08-15
 - [`pkg/tessaraop`](#pkg-tessaraop) - The public SDK. The only package an integration imports.
 - [`pkg/tessaraop/pdpserver`](#pkg-tessaraop-pdpserver) - HTTP decision point: native, explain, forward-auth and OPA-shaped endpoints.
 - [`pkg/tessaraop/audit`](#pkg-tessaraop-audit) - Structured decision audit records.
+- [`pkg/tessaraop/openfga`](#pkg-tessaraop-openfga) - Relationship resolver backed by an OpenFGA server.
+- [`internal/analyze`](#internal-analyze) - BDD-based policy analysis: unreachable, shadowed, duplicate, conflicting rules.
 - [`internal/model`](#internal-model) - Core types, operator semantics, condition trees, both combining tiers.
 - [`internal/attr`](#internal-attr) - The L3/L4/L7 attribute registry.
 - [`internal/explain`](#internal-explain) - Per-condition answers to why a decision came out as it did.
@@ -278,6 +280,38 @@ TYPES
 type Algorithm = model.Algorithm
     Algorithm selects how matching units combine.
 
+type AnalysisFinding = analyze.Finding
+    AnalysisFinding is one defect.
+
+type AnalysisOptions = analyze.Options
+    AnalysisOptions tunes an analysis.
+
+func DefaultAnalysisOptions() AnalysisOptions
+    DefaultAnalysisOptions reports unreachable rules, shadowing, duplicates and
+    conflicts within each policy.
+
+type AnalysisReport = analyze.Report
+    AnalysisReport lists policy defects found without running any request.
+
+func Analyze(policies []Policy, opt AnalysisOptions) *AnalysisReport
+    Analyze finds defects that testing cannot: rules whose conditions contradict
+    so they can never fire, rules already covered by another with the same
+    effect, duplicates, and pairs with opposite effects that can both match.
+
+    These are questions about *every possible request*, not one request, so they
+    are decided by compiling conditions to a binary decision diagram rather than
+    by sampling. An unreachable rule stays unreachable no matter how many tests
+    pass.
+
+    It is an authoring and CI tool. Rules are compared pairwise within a shard,
+    so cost grows quadratically with shard size, and both that and the diagram
+    size are bounded — past the bounds a finding says the analysis was partial
+    rather than reporting a guess.
+
+    The underlying theory is deliberately incomplete, and the incompleteness
+    is biased safely: it can report a conflict that cannot really occur,
+    but it will not call a live rule unreachable or a needed rule redundant.
+
 type Attribute = attr.Attribute
     Attribute is a registry entry.
 
@@ -446,6 +480,9 @@ func (p *PDP) Allowed(req Request) bool
     Allowed is Evaluate reduced to a boolean, for call sites that do not act on
     obligations. Prefer Evaluate: dropping the obligations silently discards
     requirements like require_mfa that a policy author expected to be enforced.
+
+func (p *PDP) AnalyzeInstalled(opt AnalysisOptions) *AnalysisReport
+    AnalyzeInstalled analyses whatever policy set this PDP currently holds.
 
 func (p *PDP) Evaluate(req Request) Decision
     Evaluate renders a decision. Safe for concurrent use.
@@ -1007,6 +1044,301 @@ type Stats struct {
 }
     Stats reports what the logger has done. Dropped is the number worth alerting
     on: it means the sink could not keep up and decisions went unrecorded.
+
+```
+
+---
+
+## pkg/tessaraop/openfga
+
+Relationship resolver backed by an OpenFGA server.
+
+```go
+package openfga // import "github.com/suga/tessaraop/pkg/tessaraop/openfga"
+
+Package openfga resolves relationships from an OpenFGA server.
+
+# Why this exists as an adapter rather than as storage
+
+TessaraOP does not store relationship tuples. That decision is recorded in
+COMPARISON.md §7.1: a tuple store needs a database, which would turn a stateless
+drop-in component into a stateful service and end the zero-dependency property.
+Relationships are consumed instead, and this is the consumer for the most widely
+deployed open implementation of the Zanzibar model.
+
+# Why it uses net/http rather than the OpenFGA SDK
+
+The SDK would be the first external dependency in the module, in the package
+closest to the request path. OpenFGA's Check API is a small JSON POST, so the
+standard library covers it, and the dependency count stays at zero.
+
+# What it does
+
+One Check call per relation named in your policies. OpenFGA answers "does this
+user hold this relation on this object" and does the graph traversal — group
+nesting, folder containment, userset rewrites — server-side, which is exactly
+the work this package deliberately does not reimplement.
+
+The relations to check must be listed, because there is no cheap way to
+enumerate "every relation this user holds" in the Check API and checking every
+relation in the model would be round trips you do not need. The set that appears
+in a policy bundle is small and known at load time.
+
+    resolver := openfga.New(openfga.Config{
+        Endpoint:  "http://localhost:8080",
+        StoreID:   storeID,
+        Relations: []string{"owner", "editor", "viewer"},
+    })
+    req := tessaraop.NewRequest("acme", "docs").Build()
+    err := tessaraop.ResolveRelations(ctx, resolver, &req, "user:anne", "document:budget")
+
+# Failure handling
+
+A failed check fails the whole resolution rather than returning the relations
+gathered so far. A truncated relation set narrows access silently, which in
+an authorization path is an outage disguised as a decision. Wrap this in
+tessaraop.RelationTimeout, and put a tessaraop.NewStaticRelations in front of it
+through a Chain if you need a locally-known subset to survive an outage.
+
+CONSTANTS
+
+const DefaultTimeout = 3 * time.Second
+    DefaultTimeout bounds a single Check call.
+
+
+TYPES
+
+type Config struct {
+	// Endpoint is the OpenFGA HTTP base URL, e.g. http://localhost:8080.
+	Endpoint string
+
+	// StoreID identifies the store. Required.
+	StoreID string
+
+	// AuthorizationModelID pins the model version.
+	//
+	// Leaving it empty makes OpenFGA use the latest model, which means a model
+	// change silently changes authorization decisions. Pin it in production and
+	// roll it forward deliberately, the same way the policy bundle generation is
+	// rolled forward.
+	AuthorizationModelID string
+
+	// Relations to check. Required: this is the set your policies name.
+	Relations []string
+
+	// Token, when set, is sent as a Bearer credential.
+	Token string
+
+	// HTTPClient overrides the default. The default sets a timeout, because an
+	// unbounded call to a relationship store sits in the request path.
+	HTTPClient *http.Client
+}
+    Config describes the server and what to ask it.
+
+type Resolver struct {
+	// Has unexported fields.
+}
+    Resolver implements tessaraop.RelationResolver against an OpenFGA server.
+
+func New(cfg Config) *Resolver
+    New builds a resolver. It does not contact the server; the first Relations
+    call does.
+
+func (r *Resolver) Relations(ctx context.Context, subject, object string) ([]string, error)
+    Relations implements tessaraop.RelationResolver.
+
+    Checks run sequentially rather than in parallel. The relation list is
+    short — the handful a policy set names — and firing concurrent requests per
+    authorization decision multiplies load on the relationship store by that
+    factor, which is the wrong trade for a component already in the request
+    path.
+
+func (r *Resolver) Validate() error
+    Validate reports a configuration that cannot work, so a caller finds out at
+    startup rather than on the first request.
+
+```
+
+---
+
+## internal/analyze
+
+BDD-based policy analysis: unreachable, shadowed, duplicate, conflicting rules.
+
+```go
+package analyze // import "github.com/suga/tessaraop/internal/analyze"
+
+Package analyze finds policy defects that testing cannot: rules that can never
+fire, rules shadowed by others, and pairs that contradict each other.
+
+# What this buys, and why it needs a BDD
+
+Everything else in this repository answers "what does this policy set do for
+*this* request". Analysis answers "what does it do for *every* request" — is
+this rule reachable at all, is that one already covered, can these two ever
+both apply. Those are satisfiability questions over infinitely many requests,
+so no amount of testing settles them.
+
+A BDD settles them exactly. See bdd.go for the representation and atoms.go for
+the theory that makes the boolean abstraction faithful to what the operators
+actually mean.
+
+# Soundness direction
+
+The theory is deliberately incomplete: when nothing can be derived about
+two predicates it treats them as independent. That biases the results in one
+direction, and it is the right one.
+
+    Under-constrained ⇒ the analyser thinks more is possible than really is.
+      - It may report a Conflict that cannot actually occur.        (noise)
+      - It will not report Unreachable for a rule that can fire.    (safe)
+      - It will not report Shadowed for a rule that is still needed. (safe)
+
+The failures it can produce are false alarms, never false reassurance, and never
+advice to delete a rule that is doing something. That asymmetry is what makes it
+safe to act on the output.
+
+# Cost
+
+This is an authoring and CI tool, not a request-path one. Rules are compared
+pairwise within a shard, so cost is quadratic in shard size, and the BDD has a
+hard node cap past which a rule is reported as too complex rather than analysed.
+Both bounds are configurable.
+
+CONSTANTS
+
+const DefaultMaxNodes = 1 << 20
+    DefaultMaxNodes bounds a single analysis. Generous enough for realistic
+    policy sets, small enough that hitting it fails fast rather than swapping.
+
+const (
+	DefaultMaxRulesPerShard = 400
+)
+    Defaults.
+
+
+TYPES
+
+type Finding struct {
+	Kind     Kind     `json:"kind"`
+	Severity Severity `json:"-"`
+	// SeverityText is the JSON form of Severity.
+	SeverityText string `json:"severity"`
+
+	PolicyID string `json:"policy_id"`
+	RuleID   string `json:"rule_id"`
+
+	// Related names the other rule, for findings about a pair.
+	RelatedPolicyID string `json:"related_policy_id,omitempty"`
+	RelatedRuleID   string `json:"related_rule_id,omitempty"`
+
+	Message string `json:"message"`
+
+	// Example is a concrete request shape demonstrating the finding, for the
+	// kinds where one exists. A conflict nobody can reproduce gets ignored; one
+	// with an example gets fixed.
+	Example []string `json:"example,omitempty"`
+}
+    Finding is one result.
+
+func (f Finding) String() string
+
+type Kind string
+    Kind identifies what was found.
+
+const (
+	// Unreachable: the rule's conditions cannot all hold simultaneously, so it
+	// can never fire. Always an authoring mistake.
+	Unreachable Kind = "unreachable"
+
+	// Shadowed: an earlier rule with the same effect already covers everything
+	// this one matches, so this one never decides anything.
+	Shadowed Kind = "shadowed"
+
+	// Conflict: two rules with opposite effects can both match the same request.
+	// Not necessarily wrong — that is what deny-overrides is for — but it should
+	// be intentional.
+	Conflict Kind = "conflict"
+
+	// Duplicate: two rules with identical conditions and the same effect.
+	Duplicate Kind = "duplicate"
+
+	// AlwaysMatches: the rule matches every request reaching its shard.
+	AlwaysMatches Kind = "always-matches"
+
+	// TooComplex: the rule exceeded the analysis budget and was skipped. Reported
+	// rather than silently omitted, so an operator knows the coverage is partial.
+	TooComplex Kind = "too-complex"
+)
+type Options struct {
+	// MaxNodes caps the BDD. Zero means DefaultMaxNodes.
+	MaxNodes int
+
+	// MaxRulesPerShard caps pairwise comparison. Zero means
+	// DefaultMaxRulesPerShard.
+	//
+	// Comparison is quadratic, so a whale shard would otherwise dominate the run.
+	// Past the cap, single-rule findings (unreachable, always-matches) are still
+	// produced — they are linear — and pairwise ones are skipped with a
+	// TooComplex finding so the gap is visible.
+	MaxRulesPerShard int
+
+	// IncludeConflicts reports rules with opposite effects that can both match.
+	// On by default; turn it off when deny-overrides makes overlap the intended
+	// design and the findings are pure noise.
+	IncludeConflicts bool
+
+	// CrossPolicy compares rules in different policies within the same shard, not
+	// only rules within one policy. Off by default: across policies an overlap is
+	// usually deliberate, and the volume is high.
+	CrossPolicy bool
+}
+    Options tunes an analysis.
+
+func DefaultOptions() Options
+    DefaultOptions reports unreachable rules, shadowing, duplicates and
+    conflicts within each policy.
+
+type Report struct {
+	Findings []Finding `json:"findings"`
+
+	PoliciesAnalysed int `json:"policies_analysed"`
+	RulesAnalysed    int `json:"rules_analysed"`
+	Shards           int `json:"shards"`
+
+	// AtomsDerived and PairsCompared describe the work done, which is what to
+	// look at when a run is slow.
+	AtomsDerived  int `json:"atoms_derived"`
+	PairsCompared int `json:"pairs_compared"`
+	BDDNodes      int `json:"bdd_nodes"`
+}
+    Report is the result of analysing a policy set.
+
+func Analyze(policies []model.Policy, opt Options) *Report
+    Analyze examines a policy set and reports defects.
+
+    Rules are grouped by shard — (tenant, scope) — because that is the only set
+    that can ever be evaluated together. Comparing rules across shards would
+    report overlaps between policies that no single request can reach.
+
+func (r *Report) Errors() []Finding
+    Errors returns only the error-severity findings.
+
+func (r *Report) HasErrors() bool
+    HasErrors reports whether any finding is an error.
+
+type Severity uint8
+    Severity ranks a finding.
+
+const (
+	// Info: worth knowing, not necessarily wrong.
+	Info Severity = iota
+	// Warning: very likely an authoring mistake.
+	Warning
+	// Error: the rule cannot do anything, or two rules directly contradict.
+	Error
+)
+func (s Severity) String() string
 
 ```
 

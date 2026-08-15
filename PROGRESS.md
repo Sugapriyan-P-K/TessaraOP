@@ -37,6 +37,7 @@ internal/
 ├── hierarchy/ role/group/resource DAG: closure, cycle detection, frozen
 ├── explain/   per-condition "why?", built on the naive path
 ├── relation/  ReBAC resolver interface + in-memory implementation
+├── analyze/   BDD + atom theory: unreachable, shadowed, duplicate, conflict
 ├── bitset/    hybrid sparse/dense integer sets
 ├── matcher/   CIDR trie, domain trie, prefix/suffix tables, interval, numeric set
 ├── index/     sub-indexes over flattened rules, two intersection strategies
@@ -220,13 +221,16 @@ count now.
 Casbin, and which authorization models are actually supported. These phases are
 ordered by the gap each closes, not by size.
 
-| Phase | Work | Gap closed |
+| Phase | Work | Status |
 |---|---|---|
-| **1** | Role/group hierarchy with transitive closure, resolved at ingest | RBAC hierarchy (High) — `subject.role` is flat today |
-| **2** | `Explain` — non-short-circuiting, built on `internal/naive`, differentially tested against `Evaluate`, with attribute redaction | Cedar + OPA parity; unblocks every POC |
-| **3** | The 4 missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat |
-| **4** | ReBAC **resolver interface** + OpenFGA / SpiceDB adapters | The Critical gap, without becoming stateful |
-| **5** | BDD/MTBDD compilation → subsumption, conflict, reachability | Cedar's differentiator |
+| **1** | Role/group hierarchy with transitive closure, resolved at ingest | **Done** — `internal/hierarchy` |
+| **2** | `Explain`, non-short-circuiting, differentially tested against `Evaluate` | **Done** — `internal/explain` |
+| **3** | The missing XACML algorithms + obligation union | **Done** — 6 of 8 |
+| **4** | ReBAC resolver interface + adapters | **Done** — interface, in-memory, and an OpenFGA adapter verified against a live server |
+| **5** | BDD compilation → unreachable, shadowed, duplicate, conflict | **Done** — `internal/analyze` |
+| **6** | Importers from other policy formats | Not started |
+
+All five phases are complete. What remains is §6 below.
 
 Phases 1 and 4 both feed the same design: resolve facts *outside* the engine and
 hand them in as attributes. Neither touches `internal/index`, `internal/model` or
