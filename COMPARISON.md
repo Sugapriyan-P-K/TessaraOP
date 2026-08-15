@@ -344,11 +344,11 @@ elements, and the linter now rejects `contains` on any registered set attribute.
 
 | Gap | Severity | Who has it |
 |---|---|---|
-| No policy analysis (subsumption, conflict, reachability) | Medium | Cedar |
 | No delta bundles or discovery API | Medium | OPA |
 | No entity type schema | Medium | Cedar |
 | No `ListObjects` over relationships | Medium | OpenFGA, SpiceDB |
 | No importers from other policy formats | Medium | — |
+| No SMT-backed equivalence or formal semantics proof | Low | Cedar |
 
 `ListObjects` — *"which documents can Anne view"* — is a reverse query over the
 relationship graph rather than a predicate evaluation, and is explicitly out of
@@ -385,15 +385,21 @@ axis instead of TessaraOP's own.
 | **2** | `Explain` — non-short-circuiting, built on the naive path, differentially tested against `Evaluate`, with attribute redaction | Cedar + OPA parity; unblocks every POC | **Done** |
 | **3** | The missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat | **Done** (6 of 8) |
 | **4** | ReBAC **resolver interface** + adapters | Critical gap, without becoming stateful | **Interface done**; adapters not written |
-| **5** | BDD/MTBDD compilation → subsumption, conflict, reachability | Cedar's moat | Not started |
+| **5** | BDD compilation → unreachability, shadowing, duplicates, conflicts | Cedar's differentiator | **Done** |
 | **6** | Importers from other policy formats | Migration | Not started |
 
-Phase 4 shipped the interface, the in-memory implementation, composition
-(chaining, timeouts, TTL caching) and the adapter contract. **OpenFGA and SpiceDB
-adapters are not included**, and that is deliberate rather than an oversight: both
-need a live server to verify against, and shipping unexercised network code as a
-"supported adapter" is exactly the kind of claim §8 forbids. The contract is
-documented in `internal/relation` and an adapter is one method.
+Phase 4 shipped the interface, an in-memory implementation, composition
+(chaining, timeouts, TTL caching), and **an OpenFGA adapter verified against a
+real server** — the integration test starts one, writes a Zanzibar-shaped model
+including a tuple-to-userset rewrite, and checks the adapter resolves it. A
+SpiceDB adapter is still unwritten; the contract in `internal/relation` makes it
+one method.
+
+Phase 5 shipped a reduced ordered BDD with an atom theory. What it does *not* do
+is Cedar's full story: there is no SMT solver, no formal semantics proof, and no
+policy-equivalence checking across whole policy sets. It answers the four
+practical questions an author asks, and the incompleteness is documented and
+biased toward false alarms rather than false reassurance.
 
 ### 7.1 The ReBAC decision, recorded
 
@@ -445,9 +451,15 @@ conversation.
 - **A ReBAC store.** TessaraOP *consumes* relationships through a resolver; it
   does not store tuples, and it cannot answer `ListObjects`. The honest phrasing
   is "integrates with your ReBAC store", never "replaces it".
-- **Shipped OpenFGA or SpiceDB adapters.** The interface and contract exist; the
-  adapters do not, because they cannot be verified without a live server.
-- **Policy analysis.** No subsumption, conflict or reachability detection.
+- **A SpiceDB adapter.** The OpenFGA one is written and verified against a live
+  server; SpiceDB's is not written.
+- **Formal verification.** There is BDD-based analysis for unreachability,
+  shadowing, duplicates and conflicts. There is no SMT solver, no
+  machine-checked semantics, and no whole-policy-set equivalence checking — all
+  three of which Cedar has. "Analysable" is fair; "formally verified" is not.
+- **Completeness of the analyser.** Its theory is deliberately partial, so it can
+  report a conflict that cannot occur. Say "it will not call a working rule dead",
+  which is the property that actually holds and is tested.
 - The five performance figures marked *not re-measured* in `README.md` and
   `DOCUMENTATION.md` §19 — the 1M sharded row, cache-hit latency, multi-core
   throughput, whale-shard tail latency, and index build cost. The

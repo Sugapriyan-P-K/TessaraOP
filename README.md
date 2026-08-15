@@ -283,7 +283,49 @@ contradicts the decision would be believed.
 Attribute values are **redacted by default**, since a trace usually travels
 somewhere less trusted than the evaluator.
 
-### 5. Roles, groups and relationships
+### 5. Static analysis — defects testing cannot find
+
+Everything above answers *"what does this policy set do for this request"*.
+Analysis answers *"what does it do for every request"*: can this rule ever fire,
+is it already covered by another, can these two contradict. Those quantify over
+infinitely many requests, so no number of passing tests settles them.
+
+```bash
+tessaraop -lint policies.json   # lint + analysis in one pass
+```
+
+```
+Analysis (11 rules across 4 shards, 25 atoms, 502 BDD nodes)
+  info: conflict: acme-break-glass/deny-critical-delete vs .../except-approved-break-glass:
+        can both match the same request with opposite effects (DENY and ALLOW)
+        (example: [action eq "delete"  resource.sensitivity in "critical"
+                   subject.role eq "security-admin"])
+```
+
+| Finding | Meaning |
+|---|---|
+| `unreachable` | Conditions contradict — the rule can never fire. Always a bug. |
+| `shadowed` | Another rule with the same effect already covers everything this matches. |
+| `duplicate` | Identical conditions and effect. |
+| `conflict` | Opposite effects that can both match. Legitimate under deny-overrides, but should be deliberate. |
+| `always-matches` | Matches every request in its shard. |
+
+Conditions compile to a **reduced ordered binary decision diagram**, so
+"unreachable" is a comparison against the false terminal rather than a search.
+The hard part is not the BDD but the *theory*: treating each predicate as an
+independent boolean would call `role=="admin" ∧ role=="viewer"` satisfiable and
+flag every mutually exclusive pair as a conflict. So atoms carry derived
+implications and exclusions — interval arithmetic for numerics, prefix
+containment for CIDR, and for anything with a finite domain, evaluating it
+directly through the engine's own matcher, which decides even regex and
+`contains` pairs exactly.
+
+**The incompleteness is biased safely.** When nothing can be derived, atoms are
+treated as independent — so the analyser may report a conflict that cannot really
+occur, but it will never call a live rule unreachable or a needed rule redundant.
+False alarms, never false reassurance.
+
+### 6. Roles, groups and relationships
 
 Hierarchies are resolved *outside* the engine and handed in as attributes, so the
 index still prunes and the hot path is untouched.
@@ -302,13 +344,29 @@ req := ingest.New("acme", "identity").
 
 **ReBAC is consumed, not stored.** A `RelationResolver` answers "what is this
 subject to this object", and the answer materializes into `subject.relations`.
-Implement it against OpenFGA, SpiceDB or your own service; a tested in-memory
-implementation ships for tests and small deployments, with object-containment and
-group expansion. Building a native tuple store would mean adding a database and
-turning a stateless component into a stateful service — `COMPARISON.md` §7.1 has
-the reasoning.
+Building a native tuple store would mean adding a database and turning a
+stateless component into a stateful service — `COMPARISON.md` §7.1 has the
+reasoning.
 
-### 6. Decision audit — `pkg/tessaraop/audit`
+Two implementations ship: an in-memory one with object-containment and group
+expansion, and **`pkg/tessaraop/openfga`**, which is verified against a real
+OpenFGA server rather than a mock — including the tuple-to-userset rewrite that
+lets a folder viewer reach the documents inside it.
+
+```go
+resolver := openfga.New(openfga.Config{
+    Endpoint: "http://localhost:8080", StoreID: storeID,
+    Relations: []string{"owner", "editor", "viewer"},
+})
+tessaraop.ResolveRelations(ctx, resolver, &req, "user:anne", "document:budget")
+// req now carries subject.relations = "editor,owner,viewer"
+```
+
+Still stdlib-only: the adapter speaks OpenFGA's Check API over `net/http` rather
+than pulling in its SDK, which would have been the first external dependency in
+the module and in the package closest to the request path.
+
+### 7. Decision audit — `pkg/tessaraop/audit`
 
 Structured records with the policy generation attached, so a decision can be tied
 back to exactly what was installed six months later. **Attribute values are not
@@ -317,7 +375,7 @@ outside the trust boundary of the service that wrote them. Writes go through a
 bounded buffer: if the sink stalls, records drop and the drop is counted, because
 a decision that cannot be logged must still be *made*.
 
-### 7. Ingestion adapters — `internal/ingest`
+### 8. Ingestion adapters — `internal/ingest`
 
 Builds a request from `*http.Request`, `net.Conn`, `*tls.ConnectionState` and your
 own token/subject verdicts, using only standard-library parsers. Parser-differential
