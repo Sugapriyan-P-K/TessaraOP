@@ -21,14 +21,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/suga/tessaraop/pkg/tessaraop"
+	"github.com/suga/tessaraop/pkg/tessaraop/audit"
 	"github.com/suga/tessaraop/pkg/tessaraop/pdpserver"
 )
 
@@ -48,7 +51,14 @@ func main() {
 		reloadToken = flag.String("reload-token", "",
 			"require this token in X-Tessaraop-Token on /v1/reload")
 		auditLog = flag.Bool("audit", false,
-			"log one line per decision to stderr")
+			"write one JSON record per decision to -audit-file, or stderr")
+		auditFile = flag.String("audit-file", "",
+			"path for the decision audit log; empty writes to stderr")
+		auditValues = flag.String("audit-values", "",
+			"comma-separated attributes whose values may appear in the audit log; "+
+				"everything else is recorded by name only")
+		auditSample = flag.Int("audit-sample-allowed", 1,
+			"record only every Nth allowed decision; denials are always recorded in full")
 		checkOnly = flag.Bool("check", false,
 			"lint the bundle and exit; non-zero status if it has errors")
 		readTimeout  = flag.Duration("read-timeout", 5*time.Second, "HTTP read timeout")
@@ -108,11 +118,42 @@ func main() {
 		TrustedProxyHops: *trustedHops,
 		ReloadToken:      *reloadToken,
 	}
+	var auditor *audit.Logger
 	if *auditLog {
+		out := io.Writer(os.Stderr)
+		if *auditFile != "" {
+			f, err := os.OpenFile(*auditFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				logger.Printf("error: cannot open audit file: %v", err)
+				os.Exit(1)
+			}
+			defer f.Close()
+			out = f
+		}
+
+		opt := audit.Options{
+			SampleAllowed: *auditSample,
+			OnError: func(err error) {
+				logger.Printf("audit: %v", err)
+			},
+		}
+		if *auditValues != "" {
+			opt.RecordValues = map[string]bool{}
+			for _, name := range strings.Split(*auditValues, ",") {
+				if n := strings.TrimSpace(name); n != "" {
+					opt.RecordValues[n] = true
+				}
+			}
+		}
+
+		var auditWarnings []string
+		auditor, auditWarnings = audit.New(audit.NewJSONLines(out), opt)
+		for _, w := range auditWarnings {
+			logger.Printf("warning: %s", w)
+		}
+
 		cfg.OnDecision = func(req tessaraop.Request, d tessaraop.Decision) {
-			logger.Printf("decision tenant=%q scope=%q effect=%s policy=%s rule=%s rules_scanned=%d cache=%v",
-				req.TenantID, req.Scope, d.Effect, d.MatchedPolicyID, d.MatchedRuleID,
-				d.RulesScanned, d.CacheHit)
+			auditor.RecordAt(req, d, pdp.Generation())
 		}
 	}
 
@@ -170,6 +211,21 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		logger.Printf("shutdown: %v", err)
+	}
+
+	// Flush the audit log after the listener is closed, so records for
+	// in-flight requests are not lost. Report drops: they mean decisions went
+	// unrecorded, which is the number worth alerting on.
+	if auditor != nil {
+		if err := auditor.Close(ctx); err != nil {
+			logger.Printf("audit flush: %v", err)
+		}
+		if s := auditor.Stats(); s.Dropped > 0 || s.Failed > 0 {
+			logger.Printf("audit: %d written, %d DROPPED, %d failed",
+				s.Written, s.Dropped, s.Failed)
+		} else {
+			logger.Printf("audit: %d records written", s.Written)
+		}
 	}
 	fmt.Fprintln(os.Stderr)
 }

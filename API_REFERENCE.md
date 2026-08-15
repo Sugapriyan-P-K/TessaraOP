@@ -3,14 +3,18 @@
 Generated from source doc comments with `go doc -all`. Do not edit by hand;
 regenerate after changing any exported declaration.
 
-Go go1.26.5 | 2026-07-26
+Go go1.26.5 | 2026-08-15
 
 ## Packages
 
 - [`pkg/tessaraop`](#pkg-tessaraop) - The public SDK. The only package an integration imports.
-- [`pkg/tessaraop/pdpserver`](#pkg-tessaraop-pdpserver) - HTTP decision point: native, forward-auth and OPA-shaped endpoints.
+- [`pkg/tessaraop/pdpserver`](#pkg-tessaraop-pdpserver) - HTTP decision point: native, explain, forward-auth and OPA-shaped endpoints.
+- [`pkg/tessaraop/audit`](#pkg-tessaraop-audit) - Structured decision audit records.
 - [`internal/model`](#internal-model) - Core types, operator semantics, condition trees, both combining tiers.
 - [`internal/attr`](#internal-attr) - The L3/L4/L7 attribute registry.
+- [`internal/explain`](#internal-explain) - Per-condition answers to why a decision came out as it did.
+- [`internal/hierarchy`](#internal-hierarchy) - Role, group and resource membership DAGs with transitive closure.
+- [`internal/relation`](#internal-relation) - ReBAC resolver interface and in-memory implementation.
 - [`internal/bundle`](#internal-bundle) - The declarative JSON policy format and its linter.
 - [`internal/ingest`](#internal-ingest) - Builds requests from real traffic using stdlib parsers only.
 - [`internal/engine`](#internal-engine) - Sharding, algorithm selection, decision cache.
@@ -80,6 +84,17 @@ const (
 	PermitOverrides = model.PermitOverrides
 	FirstApplicable = model.FirstApplicable
 
+	// DenyUnlessPermit and OnlyOneApplicable complete the order-independent
+	// XACML 3.0 set. OnlyOneApplicable is the genuinely distinct one: it detects
+	// ambiguity rather than resolving it, denying when several units apply.
+	DenyUnlessPermit  = model.DenyUnlessPermit
+	OnlyOneApplicable = model.OnlyOneApplicable
+
+	// PermitUnlessDeny grants by default: a request matching nothing is ALLOWED.
+	// That inverts the fail-closed posture the rest of this engine holds to.
+	// Confine it to a shard whose contents are exhaustively known.
+	PermitUnlessDeny = model.PermitUnlessDeny
+
 	// GlobalTenant holds platform-wide policies evaluated for every request,
 	// whatever tenant it names: blocklists, kill switches, baseline denies.
 	GlobalTenant = model.GlobalTenant
@@ -117,6 +132,15 @@ const (
 	OpNumNotIn     = model.OpNumNotIn
 	OpCIDR         = model.OpCIDR
 	OpNotCIDR      = model.OpNotCIDR
+
+	// Multi-valued set operators. Use these — never OpContains — on an attribute
+	// the registry documents as a comma-delimited set (subject.roles,
+	// subject.groups, token.scopes, resource.ancestors, transport.tcp_flags).
+	// OpContains is a substring test, so a principal holding only "readwrite"
+	// would satisfy `contains "read"`.
+	OpHasAny  = model.OpHasAny
+	OpHasAll  = model.OpHasAll
+	OpHasNone = model.OpHasNone
 )
     Operators. See the package documentation of the registry (or the -attrs
     output of cmd/tessaraop) for which apply to which attribute.
@@ -159,6 +183,10 @@ const (
     ones integrations touch most. Using a constant makes a typo a compile error
     rather than a rule that silently never matches.
 
+const AttrSubjectRelations = relation.SubjectRelations
+    AttrSubjectRelations is where ResolveRelations puts its answer. Match it
+    with OpHasAny / OpHasAll / OpHasNone.
+
 
 VARIABLES
 
@@ -181,6 +209,11 @@ var (
 	SimplePolicy = model.SimplePolicy
 )
     Condition-tree builders.
+
+var ErrHierarchyCycle = hierarchy.ErrCycle
+    ErrHierarchyCycle is reported when a membership graph is not acyclic.
+    A cycle is always an authoring mistake, and tolerating one would make a
+    principal's effective roles depend on traversal order.
 
 var ErrNoPolicies = errors.New("tessaraop: policy set is empty")
     ErrNoPolicies is returned when a load would leave the PDP with nothing.
@@ -215,6 +248,14 @@ func HasErrors(diags []Diagnostic) bool
 func Header(name string) string
     Header returns the attribute name for an HTTP request header.
 
+func NewStaticRelations(tuples ...RelationTuple) *relation.Static
+    NewStaticRelations returns an in-memory relationship resolver.
+
+    It is not a substitute for a real ReBAC store — no persistence,
+    no consistency model, no reverse index — but it covers tests, local
+    development, and deployments whose relationship set is genuinely small and
+    static.
+
 func OpenBundle(path string, cfg Config) (*PDP, []Diagnostic, error)
     OpenBundle builds a PDP from a bundle file in one call.
 
@@ -223,6 +264,13 @@ func QueryParam(name string) string
 
 func ReadBundle(r io.Reader, cfg Config) (*PDP, []Diagnostic, error)
     ReadBundle builds a PDP from a bundle read from r.
+
+func ResolveRelations(ctx context.Context, r RelationResolver, req *Request, subject, object string) error
+    ResolveRelations resolves the subject's relations to the object and writes
+    them into the request, ready for evaluation.
+
+    Call it while assembling a request, never on a hot loop: a resolver may
+    perform I/O. Wrap a remote one in RelationTimeout.
 
 
 TYPES
@@ -265,6 +313,17 @@ type Config struct {
 	// largest win available.
 	CacheSize int
 
+	// UnionObligations collects obligations from every matching rule carrying the
+	// winning effect, rather than only from the one credited.
+	//
+	// It removes the caveat on Algorithm above — that obligations depend on which
+	// of several equally-valid matches was reached first — and it is what XACML
+	// specifies. The cost is short-circuiting: the engine must see every
+	// candidate, so deny-overrides can no longer stop at the first deny. Enable
+	// it where a dropped require_mfa would be a security incident; leave it off
+	// where throughput dominates.
+	UnionObligations bool
+
 	// Lint tunes validation of bundles loaded through this PDP.
 	Lint LintOptions
 }
@@ -294,8 +353,43 @@ func ValidatePolicies(policies []Policy, opt LintOptions) []Diagnostic
 type Effect = model.Effect
     Effect is ALLOW or DENY.
 
+type ExplainOptions = explain.Options
+    ExplainOptions controls how much an explanation reveals.
+
+func DefaultExplainOptions() ExplainOptions
+    DefaultExplainOptions redacts observed attribute values, includes rules that
+    did not match, and omits policies the request could not reach.
+
+type Explanation = explain.Explanation
+    Explanation is the full account of why a decision came out as it did.
+
 type Expr = model.ConditionExpr
     Expr is a boolean tree over conditions.
+
+type Hierarchy = hierarchy.Graph
+    Hierarchy is a membership DAG: role inheritance, nested groups, or resource
+    containment.
+
+    It is resolved *outside* the engine. A principal holding "admin" in a graph
+    where admin inherits editor inherits viewer arrives carrying subject.roles
+    = "admin,editor,viewer", and an ordinary indexed operator (OpHasAny) answers
+    the question. The engine gains no new concept, the index still prunes,
+    and the evaluation path is untouched — the same division of labour that
+    keeps parsing and I/O outside the hot path.
+
+func HierarchyFromMap(m map[string][]string) (*Hierarchy, error)
+    HierarchyFromMap builds and freezes a graph from a child -> parents mapping,
+    which is the shape a configuration file naturally carries. It reports an
+    error if the graph contains a cycle.
+
+        roles, err := tessaraop.HierarchyFromMap(map[string][]string{
+            "admin":  {"editor"},
+            "editor": {"viewer"},
+        })
+
+func NewHierarchy() *Hierarchy
+    NewHierarchy returns an empty, unfrozen membership graph. Call Add to record
+    that a child is subsumed by its parents, then Freeze.
 
 type Info struct {
 	Generation      uint64 `json:"generation"`
@@ -344,8 +438,6 @@ type Operator = model.Operator
 type PDP struct {
 	// Has unexported fields.
 }
-    PDP is a policy decision point: an immutable indexed policy set behind an
-    atomic pointer, plus the counters an operator needs to see it working.
 
 func New(policies []Policy, cfg Config) (*PDP, error)
     New builds a PDP over policies held in memory.
@@ -357,6 +449,25 @@ func (p *PDP) Allowed(req Request) bool
 
 func (p *PDP) Evaluate(req Request) Decision
     Evaluate renders a decision. Safe for concurrent use.
+
+func (p *PDP) Explain(req Request, opt ExplainOptions) *Explanation
+    Explain reports why the request produced the decision it did: which policies
+    were in scope, which rules were evaluated, and for each condition whether
+    the attribute was present and whether it matched.
+
+    It is a deliberately slower second path. Evaluate is allocation-free and
+    runs in microseconds; threading a trace through it would cost that for
+    every request in order to serve the rare one where somebody is asking a
+    question. So Explain bypasses the index, evaluates every in-scope rule,
+    and short-circuits nowhere — an author wants every failing condition,
+    not the first one checked.
+
+    Do not call it on the hot path. Call it from a support tool, a CLI, or an
+    endpoint a human hits.
+
+    The returned Decision is computed on the same inputs as Evaluate and is
+    asserted to agree with it; an explanation that contradicted the decision
+    would be worse than none, because it would be believed.
 
 func (p *PDP) Generation() uint64
     Generation counts how many policy sets have been installed. It changes on
@@ -379,6 +490,10 @@ func (p *PDP) LoadBundleFile(path string) ([]Diagnostic, error)
 func (p *PDP) Metrics() MetricsSnapshot
     Metrics returns a snapshot of the counters.
 
+func (p *PDP) Policies() []Policy
+    Policies returns the installed policy set. The slice is owned by the PDP and
+    must not be modified; copy it if you need to.
+
 func (p *PDP) ReachableRules(tenantID, scope string) int
     ReachableRules reports how many rules a request to this tenant and scope can
     reach. It is the number that governs per-request cost, and the one to watch
@@ -393,6 +508,33 @@ func (p *PDP) Reload(policies []Policy) error
 
 type Policy = model.Policy
     Policy is a tenanted collection of rules.
+
+type RelationResolver = relation.Resolver
+    RelationResolver answers what relations a subject holds to an object.
+
+    Relationships are *consumed*, not stored: TessaraOP does not implement a
+    Zanzibar-style tuple store, because that would require a database and turn
+    a stateless drop-in component into a stateful service. Instead a resolver is
+    called once per request, before evaluation, and the answer is materialized
+    into subject.relations where an indexed operator (OpHasAny) matches it.
+
+    Implement this against OpenFGA, SpiceDB or your own service. See package
+    relation for the adapter contract and for the in-memory implementation used
+    in tests and small deployments.
+
+func RelationCache(r RelationResolver, ttl time.Duration) RelationResolver
+    RelationCache memoizes resolutions for a bounded time. A cached relationship
+    is a stale authorization decision, so the TTL is required and there is no
+    invalidation hook — if your relationships must take effect immediately,
+    cache them where the writes are instead.
+
+func RelationTimeout(r RelationResolver, d time.Duration) RelationResolver
+    RelationTimeout bounds how long a resolver may take. A remote relationship
+    store sits in the request path, so an unbounded call there is an
+    availability risk for everything behind it.
+
+type RelationTuple = relation.Tuple
+    RelationTuple is one relationship fact.
 
 type Request = model.Request
     Request is one access check: a tenant, a scope, and typed attributes.
@@ -461,7 +603,7 @@ type Rule = model.Rule
 
 ## pkg/tessaraop/pdpserver
 
-HTTP decision point: native, forward-auth and OPA-shaped endpoints.
+HTTP decision point: native, explain, forward-auth and OPA-shaped endpoints.
 
 ```go
 package pdpserver // import "github.com/suga/tessaraop/pkg/tessaraop/pdpserver"
@@ -582,6 +724,17 @@ type Config struct {
 	// logging. It runs on the request goroutine, so it must not block.
 	OnDecision func(req tessaraop.Request, d tessaraop.Decision)
 
+	// AllowExplainRevealValues permits /v1/explain to echo observed attribute
+	// values instead of redacting them.
+	//
+	// Off by default. A trace shows what the request actually carried, which is
+	// what makes it useful and also what makes it sensitive — and this endpoint
+	// is reachable by anyone who can reach the PDP. Enable it for a local or
+	// staging deployment; naming individual attributes in reveal_attributes is
+	// the better answer in production, since that is an explicit and auditable
+	// choice rather than a blanket one.
+	AllowExplainRevealValues bool
+
 	// ReloadToken, when set, is required in the X-Tessaraop-Token header on
 	// /v1/reload.
 	//
@@ -632,6 +785,33 @@ type DecisionResponse struct {
 }
     DecisionResponse is the native response envelope.
 
+type ExplainRequest struct {
+	DecisionRequest
+
+	// RevealValues turns off redaction of observed attribute values.
+	//
+	// It is refused unless the server was started with
+	// Config.AllowExplainRevealValues, because a trace echoes what the request
+	// carried and this endpoint is reachable by whoever can reach the PDP. The
+	// ingest layer works hard to keep credentials out of attributes; an
+	// explanation must not undo that.
+	RevealValues bool `json:"reveal_values,omitempty"`
+
+	// RevealAttributes names individual attributes whose values may be shown
+	// even while the rest stay redacted. Always permitted: naming an attribute
+	// is an explicit, auditable choice, unlike revealing everything.
+	RevealAttributes []string `json:"reveal_attributes,omitempty"`
+
+	// IncludeOutOfScope reports policies the request could not reach, which is
+	// what you want when the surprise is that a policy did *not* apply.
+	IncludeOutOfScope bool `json:"include_out_of_scope,omitempty"`
+
+	// MaxPolicies caps the trace size. Zero uses the default.
+	MaxPolicies int `json:"max_policies,omitempty"`
+}
+    ExplainRequest is a decision request plus the knobs that control how much
+    the trace reveals.
+
 type Server struct {
 	// Has unexported fields.
 }
@@ -642,6 +822,191 @@ func New(cfg Config) (*Server, []string, error)
     usable but has a footgun worth surfacing in a startup log.
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request)
+
+```
+
+---
+
+## pkg/tessaraop/audit
+
+Structured decision audit records.
+
+```go
+package audit // import "github.com/suga/tessaraop/pkg/tessaraop/audit"
+
+Package audit records decisions for compliance, incident review and debugging.
+
+# Why this is not just a log line
+
+An authorization decision is a compliance artifact. "Who was allowed to do what,
+when, and under which policy" is the question an auditor asks, and answering it
+six months later requires that the record be structured, complete, and tied to
+the exact policy set that produced it. A printf in a handler does not survive
+that conversation.
+
+So a Record carries the decision, the rule credited, the generation of the
+policy set that was installed at the time, and a bounded, redacted view of the
+request.
+
+# Two things this refuses to do
+
+**It does not log attribute values by default.** A request carries whatever the
+integration put in it, and package ingest works hard to keep credentials out of
+attributes — an audit sink that echoed them wholesale would undo that at the
+worst possible place, since audit logs are retained for years and shipped to
+third-party systems. Attribute *names* are recorded; values only for attributes
+explicitly allowlisted.
+
+**It does not block the request path.** Writes go through a bounded buffer and
+a background goroutine. If the sink cannot keep up the buffer fills and records
+are dropped, with the drop counted — because an authorization decision that
+cannot be logged must still be *made*. Blocking a decision on a slow log shipper
+turns an observability problem into an availability one.
+
+That last choice has a consequence worth stating plainly: this sink is
+lossy under pressure. If your compliance regime requires that no decision go
+unrecorded, you need a durable queue, and this is the wrong component.
+
+CONSTANTS
+
+const DefaultBuffer = 4096
+    DefaultBuffer bounds the queue.
+
+
+TYPES
+
+type JSONLines struct {
+	// Has unexported fields.
+}
+    JSONLines writes one JSON object per line, which is what every log shipper
+    already understands.
+
+func NewJSONLines(w io.Writer) *JSONLines
+    NewJSONLines returns a sink writing newline-delimited JSON to w.
+
+func (j *JSONLines) Write(r Record) error
+    Write implements Sink.
+
+type Logger struct {
+	// Has unexported fields.
+}
+    Logger turns decisions into records and hands them to a Sink without
+    blocking the caller.
+
+func New(sink Sink, opt Options) (*Logger, []string)
+    New starts a logger. Close it to flush.
+
+    It returns warnings for configurations that are legal but worth seeing in a
+    startup log, in the same spirit as pdpserver.New.
+
+func (l *Logger) Close(ctx context.Context) error
+    Close stops the logger and waits for queued records to be written.
+
+    It is safe to call more than once. Records submitted after Close are dropped
+    silently rather than panicking on a closed channel, because shutdown races
+    with in-flight requests by nature.
+
+func (l *Logger) Record(req tessaraop.Request, d tessaraop.Decision)
+    Record queues a decision. It never blocks.
+
+    This is the signature pdpserver.Config.OnDecision expects, so wiring it up
+    is one line.
+
+func (l *Logger) RecordAt(req tessaraop.Request, d tessaraop.Decision, generation uint64)
+    RecordAt is Record with the policy generation, which the caller knows and
+    the decision does not carry.
+
+func (l *Logger) Stats() Stats
+    Stats returns a snapshot.
+
+type Options struct {
+	// RecordValues names attributes whose values may be written. Everything else
+	// is recorded by name only.
+	//
+	// The allowlist is the whole design. Audit logs are retained for years and
+	// shipped to systems outside the trust boundary of the service that produced
+	// them, so "record everything and redact later" is not a posture that
+	// survives contact with a real incident.
+	RecordValues map[string]bool
+
+	// RecordAllValues writes every attribute value. Intended for a local debug
+	// session; it is a deliberate footgun and Logger warns when it is set.
+	RecordAllValues bool
+
+	// Buffer is how many records may be queued before writes are dropped. Zero
+	// means DefaultBuffer.
+	Buffer int
+
+	// SampleAllowed records only every Nth allowed decision. Denials are always
+	// recorded in full, because they are what an investigation starts from and
+	// they are far rarer.
+	//
+	// Zero or one records everything.
+	SampleAllowed int
+
+	// Now supplies the clock, for tests.
+	Now func() time.Time
+
+	// OnError is called when the sink returns an error. It must not block. A nil
+	// OnError discards the error, which is the right default: an audit write
+	// failing must not take down the decision path.
+	OnError func(error)
+}
+    Options configures a Logger.
+
+type Record struct {
+	Time time.Time `json:"time"`
+
+	TenantID string `json:"tenant_id,omitempty"`
+	Scope    string `json:"scope,omitempty"`
+
+	Allowed     bool     `json:"allowed"`
+	Effect      string   `json:"effect"`
+	PolicyID    string   `json:"policy_id,omitempty"`
+	RuleID      string   `json:"rule_id,omitempty"`
+	Obligations []string `json:"obligations,omitempty"`
+
+	// Generation identifies the policy set that produced this decision, so a
+	// record can be tied back to exactly what was installed at the time. Without
+	// it a six-month-old audit record cannot be reproduced.
+	Generation uint64 `json:"generation"`
+
+	// CacheHit reports that the decision was served from cache. Worth recording:
+	// a cached decision was computed against the generation stored with the
+	// cache entry, not necessarily the current one.
+	CacheHit bool `json:"cache_hit,omitempty"`
+
+	RulesScanned int `json:"rules_scanned,omitempty"`
+
+	// Attributes names what the request carried. Values appear only for
+	// allowlisted attributes; see Options.RecordValues.
+	Attributes map[string]string `json:"attributes,omitempty"`
+	// AttributeNames lists the attributes present but not recorded by value,
+	// so an investigator knows what was available without seeing it.
+	AttributeNames []string `json:"attribute_names,omitempty"`
+}
+    Record is one audited decision.
+
+type Sink interface {
+	Write(Record) error
+}
+    Sink consumes audit records. Implementations must be safe for concurrent
+    use.
+
+type SinkFunc func(Record) error
+    SinkFunc adapts a function to Sink.
+
+func (f SinkFunc) Write(r Record) error
+    Write implements Sink.
+
+type Stats struct {
+	Seen    uint64 `json:"seen"`
+	Written uint64 `json:"written"`
+	Dropped uint64 `json:"dropped"`
+	Failed  uint64 `json:"failed"`
+}
+    Stats reports what the logger has done. Dropped is the number worth alerting
+    on: it means the sink could not keep up and decisions went unrecorded.
 
 ```
 
@@ -676,6 +1041,10 @@ const GlobalTenant = "__global__"
     GlobalTenant holds platform-wide policies evaluated for every request
     regardless of the request's own tenant (blocklists, kill switches).
 
+const SetDelimiter = ','
+    SetDelimiter separates elements of a multi-valued string attribute. The
+    registry documents this convention for every attribute that carries a set.
+
 const TenantWideScope = ""
     TenantWideScope is the scope of policies applying across an entire tenant,
     evaluated alongside whichever scope a request names.
@@ -683,14 +1052,25 @@ const TenantWideScope = ""
 
 VARIABLES
 
-var AllAlgorithms = []Algorithm{DenyOverrides, PermitOverrides, FirstApplicable}
+var AllAlgorithms = []Algorithm{
+	DenyOverrides, PermitOverrides, FirstApplicable,
+	DenyUnlessPermit, PermitUnlessDeny, OnlyOneApplicable,
+}
     AllAlgorithms lists every combining algorithm, for the linter and docs.
+
+    The XACML "ordered-" variants are deliberately absent. They resolve ties
+    by document order, and this engine's index yields candidates in whatever
+    order the underlying sets enumerate — so honouring document order would
+    mean sorting every candidate set and forfeiting the short-circuiting that
+    order-independence buys. FirstApplicable covers the same intent with an
+    explicit Priority, which is order-independent and therefore sound here.
 
 var AllOperators = []Operator{
 	OpEquals, OpNotEquals, OpIn, OpNotIn,
 	OpContains, OpNotContains, OpPrefix, OpNotPrefix,
 	OpSuffix, OpNotSuffix, OpRegex, OpNotRegex,
 	OpDNSSuffix, OpNotDNSSuffix,
+	OpHasAny, OpHasAll, OpHasNone,
 	OpExists, OpNotExists,
 	OpRange, OpNotRange, OpGreaterThan, OpGreaterEq,
 	OpLessThan, OpLessEq, OpNumEquals, OpNumNotEq,
@@ -712,6 +1092,19 @@ func ConsiderPolicy(p *Policy, req Request, positions []int, acc *Accumulator) i
     positions names the rule indices the index selected as candidates.
     It returns how many rules reached exact validation.
 
+func ForEachSetMember(value string, fn func(string) bool)
+    ForEachSetMember calls fn for each element of a delimited multi-valued
+    attribute, stopping early if fn returns false.
+
+    It takes a callback rather than returning a slice because it runs on the
+    evaluation path: splitting into a []string would allocate once per condition
+    per request, and the whole hot path is otherwise allocation-free. Substrings
+    share the value's backing array, so this allocates nothing.
+
+    Surrounding whitespace is trimmed and empty elements are skipped, so "admin,
+    editor" and "admin,editor" mean the same thing and a trailing comma is
+    harmless.
+
 func MatchDNSSuffix(host, suffix string) bool
     MatchDNSSuffix reports whether host equals suffix or is a subdomain of it.
     Matching is label-aligned, so "evilexample.com" does NOT match "example.com"
@@ -722,6 +1115,17 @@ TYPES
 
 type Accumulator struct {
 	Algorithm Algorithm
+
+	// UnionObligations collects obligations from every matching verdict carrying
+	// the winning effect, rather than only from the one credited.
+	//
+	// It removes the attribution caveat that otherwise makes obligations depend
+	// on which of several equally-valid matches the evaluator reached first, and
+	// it is what XACML actually specifies. The cost is that it forfeits
+	// short-circuiting: the accumulator must see every candidate to collect from
+	// them, so DenyOverrides can no longer stop at the first Deny. Off by
+	// default for that reason.
+	UnionObligations bool
 
 	// Has unexported fields.
 }
@@ -746,7 +1150,9 @@ func (a *Accumulator) Consider(v Verdict)
 
 func (a *Accumulator) Reset(alg Algorithm)
     Reset clears the accumulator for reuse under alg. Empty alg means
-    DenyOverrides.
+    DenyOverrides. Reset preserves UnionObligations, so the inner tier inherits
+    the outer tier's obligation semantics rather than silently diverging from
+    it.
 
 func (a *Accumulator) Resolve() Decision
     Resolve produces the final decision under the configured algorithm.
@@ -782,6 +1188,35 @@ const (
 	// engine must see every candidate — strictly more expensive than
 	// DenyOverrides. Needed for exception rules ("deny all except X").
 	FirstApplicable Algorithm = "first-applicable"
+
+	// DenyUnlessPermit: any matching Allow wins; everything else denies.
+	//
+	// It differs from PermitOverrides only in attribution. With no Allow but a
+	// matching Deny, PermitOverrides credits that Deny while this credits
+	// nothing, because XACML defines this algorithm as never producing an
+	// Indeterminate or NotApplicable result — it always resolves to Permit or
+	// Deny. The enforceable outcome is identical. Provided for conformance and
+	// for policy sets migrated from an XACML engine.
+	DenyUnlessPermit Algorithm = "deny-unless-permit"
+
+	// PermitUnlessDeny: any matching Deny wins; everything else permits.
+	//
+	// This is the one algorithm here that grants by default. A request matching
+	// nothing at all is ALLOWED, which inverts the fail-closed posture the rest
+	// of this engine is built on. It exists because XACML defines it and some
+	// migrated policy sets depend on it; it should be confined to a shard whose
+	// contents are exhaustively known, never used as a corpus-wide default.
+	PermitUnlessDeny Algorithm = "permit-unless-deny"
+
+	// OnlyOneApplicable: exactly one unit may apply. If several do, the result is
+	// Indeterminate, which this engine resolves as a deny.
+	//
+	// Unlike the algorithms above this one is genuinely distinct: it detects
+	// ambiguity rather than resolving it. Use it where overlapping policies
+	// indicate a configuration error that should fail loudly — a routing table
+	// where two rules claim the same traffic, say — rather than being silently
+	// arbitrated.
+	OnlyOneApplicable Algorithm = "only-one-applicable"
 )
 type Condition struct {
 	Attribute string
@@ -950,6 +1385,11 @@ func EvaluatePolicyPositions(policies []Policy, positions []int, req Request, al
     The copy version allocated proportionally to candidate-set size and showed
     up directly in benchmark allocs/op.
 
+func EvaluateUnion(policies []Policy, req Request, alg Algorithm, unionObligations bool) Decision
+    EvaluateUnion is Evaluate with explicit obligation union semantics.
+    The naive evaluator and the indexed engine both route through this, so a
+    differential test can exercise union mode on both sides.
+
 func (d Decision) String() string
 
 type Effect string
@@ -1022,6 +1462,23 @@ const (
 	// acme.com, which is a live authorization-bypass class.
 	OpDNSSuffix    Operator = "dnssuffix"  // host is, or is under, any domain in Values
 	OpNotDNSSuffix Operator = "ndnssuffix" // host is under none of Values
+
+	// -- Multi-valued set family --
+	//
+	// These read an attribute whose value is a comma-delimited *set* — the
+	// convention the registry documents for subject.roles, subject.groups,
+	// token.scopes and transport.tcp_flags — and test membership of whole
+	// elements.
+	//
+	// They exist because OpContains is wrong for this and wrong in the dangerous
+	// direction. A principal holding only "readwrite" satisfies
+	// `subject.roles contains "read"`, because that is a substring test. For a
+	// role check that is a privilege escalation. These operators split on the
+	// delimiter and compare complete elements, so "read" matches "read" and
+	// never "readwrite".
+	OpHasAny  Operator = "has_any"  // the set shares at least one element with Values
+	OpHasAll  Operator = "has_all"  // the set contains every element of Values
+	OpHasNone Operator = "has_none" // the set shares no element with Values
 
 	OpExists    Operator = "exists"  // the attribute is present
 	OpNotExists Operator = "nexists" // the attribute is absent
@@ -1106,6 +1563,14 @@ func (p *Policy) ResolveAt(req Request, positions []int) (Verdict, bool, int)
     Positions outside the rule slice are ignored rather than panicking, so an
     index that has drifted from its policies degrades to under-selective instead
     of crashing the decision path.
+
+func (p *Policy) ResolveAtUnion(req Request, positions []int, unionObligations bool) (Verdict, bool, int)
+    ResolveAtUnion is ResolveAt with explicit obligation union semantics.
+
+func (p *Policy) ResolveUnion(req Request, unionObligations bool) (Verdict, bool, int)
+    ResolveUnion is Resolve with explicit control over obligation union
+    semantics, so the inner tier applies the same rule the outer one was
+    configured with.
 
 func (p *Policy) RuleCount() int
     RuleCount reports how many rules this policy holds. The index universe is
@@ -1367,9 +1832,9 @@ var Catalog = []Attribute{
 	s("subject.id", LayerIdentity, "Stable principal identifier."),
 	s("subject.type", LayerIdentity, "Principal class: user, service, device."),
 	s("subject.role", LayerIdentity, "Primary role."),
-	s("subject.roles", LayerIdentity, "Comma-joined roles, for contains checks against multi-role principals."),
+	s("subject.roles", LayerIdentity, "Comma-joined roles. Carries the transitive closure when a role hierarchy is configured, so it is a superset of subject.role. Match with has_any / has_all / has_none, never contains."),
 	s("subject.department", LayerIdentity, "Organisational unit."),
-	s("subject.groups", LayerIdentity, "Comma-joined group memberships."),
+	s("subject.groups", LayerIdentity, "Comma-joined group memberships, transitively closed when a group hierarchy is configured. Match with has_any / has_all / has_none, never contains."),
 	s("subject.mfa_verified", LayerIdentity, "\"true\" or \"false\"."),
 	s("subject.device_managed", LayerIdentity, "\"true\" or \"false\": device is enrolled and compliant."),
 	n("subject.risk_score", LayerIdentity, "Continuous risk assessment, 0 to 100."),
@@ -1397,6 +1862,7 @@ var Catalog = []Attribute{
 	s("resource.path", LayerResource, "Hierarchical path of the resource."),
 	s("resource.sensitivity", LayerResource, "Classification: low, medium, high, critical."),
 	s("resource.owner", LayerResource, "Principal owning the resource, for relationship checks."),
+	s("resource.ancestors", LayerResource, "Comma-joined containment ancestors of the resource, closest first, including the resource itself. Match with has_any so a policy scoped to a folder or project covers everything beneath it."),
 	s("action", LayerResource, "Operation requested, e.g. read, write, delete, admin."),
 	n("graphql.depth", LayerResource, "Maximum nesting depth of the incoming query."),
 	n("graphql.complexity", LayerResource, "Computed cost score of the incoming query."),
@@ -1500,6 +1966,565 @@ func (l Layer) String() string
 
 ---
 
+## internal/explain
+
+Per-condition answers to why a decision came out as it did.
+
+```go
+package explain // import "github.com/suga/tessaraop/internal/explain"
+
+Package explain answers "why?" about a decision.
+
+# Why this is a separate path, not a flag on Evaluate
+
+Evaluate is allocation-free and measured in microseconds. Threading a trace
+through it would wreck both properties for every request, in order to serve
+the rare one where somebody is asking a question. So Explain is a deliberately
+slower second path that trades speed for detail.
+
+That choice falls out well, because the index actively works against
+explanation. A rule pruned by the pre-filter never reached validation, so there
+is no natural place to record why it did not match — the filter only knows the
+rule was excluded, not which condition would have failed. Explain therefore
+bypasses the index entirely and evaluates every in-scope rule directly, which is
+what package naive already does.
+
+# Two things that must be true
+
+First, **the explanation must agree with the decision it explains.** An
+explanation that contradicts Evaluate is worse than none, because it will be
+believed. Explain returns the decision it computed, and a differential test
+asserts it matches Evaluate on the same input.
+
+Second, **tracing must not short-circuit.** And stops at the first false child
+and Or at the first true one, which is right for evaluation and wrong for
+explanation: an author wants every failing condition, not just the one that
+happened to be checked first. So the traversal here evaluates every node.
+
+# Attribute values in traces
+
+A trace shows what the request actually carried, which is what makes it useful
+and also what makes it sensitive. Package ingest works hard to keep credentials
+out of attributes; an explanation must not undo that by echoing values into a
+log or an API response. Options.Redact controls it, and the default redacts.
+
+CONSTANTS
+
+const DefaultMaxPolicies = 200
+    DefaultMaxPolicies bounds a trace.
+
+const Redacted = "<redacted>"
+    Redacted is what a hidden attribute value is replaced with.
+
+
+TYPES
+
+type AttributeCount struct {
+	Attribute string `json:"attribute"`
+	Failures  int    `json:"failures"`
+	// Absent counts the failures caused by the request not carrying the
+	// attribute at all, as opposed to carrying a value that did not satisfy the
+	// condition. A high Absent count is an integration bug, not a policy one.
+	Absent int `json:"absent"`
+}
+    AttributeCount is how often one attribute defeated a condition.
+
+type Explanation struct {
+	// Decision is what the engine concluded. It is computed by this package on
+	// the same inputs, and a differential test asserts it matches Evaluate.
+	Decision model.Decision `json:"decision"`
+
+	// Algorithm is the shard-level combining algorithm applied.
+	Algorithm string `json:"algorithm"`
+
+	// Summary is a one-line human answer to "why?".
+	Summary string `json:"summary"`
+
+	// Policies are the traces, in corpus order.
+	Policies []PolicyTrace `json:"policies"`
+
+	// Truncated reports that MaxPolicies cut the trace short.
+	Truncated bool `json:"truncated,omitempty"`
+
+	// Counts, which hold even when the trace was truncated.
+	PoliciesInScope int `json:"policies_in_scope"`
+	RulesEvaluated  int `json:"rules_evaluated"`
+	RulesMatched    int `json:"rules_matched"`
+}
+    Explanation is the full account of one decision.
+
+func Explain(policies []model.Policy, req model.Request, alg model.Algorithm, opt Options) *Explanation
+    Explain evaluates the policies against the request and reports why the
+    result came out as it did.
+
+    Policies are the full corpus; scoping is applied here exactly as the engine
+    applies it, so an out-of-scope policy is reported as such rather than
+    silently omitted.
+
+func (ex *Explanation) UnmatchedAttributes() []AttributeCount
+    UnmatchedAttributes reports the attributes that most often defeated a rule,
+    most frequent first.
+
+    This is the aggregate view an integrator wants during onboarding: a policy
+    set that denies everything usually does so because one attribute is never
+    being supplied, and that shows up here immediately rather than by reading
+    traces one at a time.
+
+type LeafTrace struct {
+	Attribute string `json:"attribute"`
+	Operator  string `json:"operator"`
+	Matched   bool   `json:"matched"`
+
+	// Present reports whether the request carried the attribute at all. This is
+	// the single most useful field in a trace: the engine fails closed on absent
+	// attributes, so "not present" explains far more denials than a value
+	// mismatch does.
+	Present bool `json:"present"`
+
+	// Actual is what the request carried, redacted unless allowed.
+	Actual string `json:"actual,omitempty"`
+	// Expected is what the condition wanted. Never redacted — it comes from the
+	// policy, which the reader is entitled to see.
+	Expected string `json:"expected,omitempty"`
+
+	// Why is the reason in words.
+	Why string `json:"why"`
+
+	// Indexable reports whether this condition sits on the rule's AND-spine and
+	// can therefore contribute an index filter. Conditions under an Or or a Not
+	// cannot, which is a performance property worth surfacing to a policy author
+	// who is wondering why their shard is slow.
+	Indexable bool `json:"indexable"`
+}
+    LeafTrace is one condition's evaluation against the request.
+
+type NodeTrace struct {
+	Kind    string       `json:"kind"` // leaf, and, or, not
+	Matched bool         `json:"matched"`
+	Leaf    *LeafTrace   `json:"leaf,omitempty"`
+	Sub     []*NodeTrace `json:"sub,omitempty"`
+}
+    NodeTrace is one node of an evaluated condition tree.
+
+type Options struct {
+	// Redact replaces observed attribute values with a placeholder. On by
+	// default via DefaultOptions, because an explanation is usually going
+	// somewhere less trusted than the evaluator: a log, an API response, a
+	// support ticket.
+	//
+	// Turning it off is reasonable for a local CLI session against a test
+	// corpus, and rarely reasonable in production.
+	Redact bool
+
+	// RedactExcept names attributes whose values are safe to show even when
+	// Redact is on — a role, an action, a country. Without it a redacted trace
+	// is often too vague to act on.
+	RedactExcept map[string]bool
+
+	// IncludeNonMatching includes rules that did not match. On by default: "why
+	// was I denied" is usually answered by a rule that *nearly* matched, and
+	// omitting non-matching rules omits the answer.
+	IncludeNonMatching bool
+
+	// IncludeOutOfScope includes policies the request could not reach at all.
+	// Off by default — on a large corpus that is most of it — but useful when
+	// the surprise is that a policy did *not* apply.
+	IncludeOutOfScope bool
+
+	// MaxPolicies caps how many policies appear in the trace. Zero means
+	// DefaultMaxPolicies. A trace over a whale shard would otherwise be
+	// unreadable and expensive to serialize.
+	MaxPolicies int
+}
+    Options controls how much an explanation reveals and how much work it does.
+
+func DefaultOptions() Options
+    DefaultOptions is the safe starting point: redacted, non-matching rules
+    included, out-of-scope policies omitted.
+
+type PolicyTrace struct {
+	PolicyID string `json:"policy_id"`
+	TenantID string `json:"tenant_id,omitempty"`
+	Scope    string `json:"scope,omitempty"`
+	Priority int    `json:"priority,omitempty"`
+
+	// InScope reports whether the request could reach this policy at all.
+	InScope bool `json:"in_scope"`
+	// OutOfScopeReason explains a false InScope in words.
+	OutOfScopeReason string `json:"out_of_scope_reason,omitempty"`
+
+	// RuleAlgorithm combines this policy's own rules.
+	RuleAlgorithm string `json:"rule_algorithm,omitempty"`
+
+	Rules []RuleTrace `json:"rules,omitempty"`
+
+	// Matched reports whether any rule matched, and Verdict is what the policy
+	// resolved to if so.
+	Matched bool         `json:"matched"`
+	Verdict *VerdictInfo `json:"verdict,omitempty"`
+
+	// Decisive marks the policy that produced the final decision.
+	Decisive bool `json:"decisive,omitempty"`
+}
+    PolicyTrace is one policy's contribution.
+
+type RuleTrace struct {
+	RuleID   string `json:"rule_id"`
+	Effect   string `json:"effect"`
+	Priority int    `json:"priority,omitempty"`
+	Matched  bool   `json:"matched"`
+
+	// Why summarizes, in one line, what decided this rule.
+	Why string `json:"why"`
+
+	// Condition is the evaluated condition tree. Nil for a catch-all rule.
+	Condition *NodeTrace `json:"condition,omitempty"`
+}
+    RuleTrace is one rule's evaluation.
+
+type VerdictInfo struct {
+	RuleID      string   `json:"rule_id"`
+	Effect      string   `json:"effect"`
+	Obligations []string `json:"obligations,omitempty"`
+}
+    VerdictInfo is a policy's resolved outcome.
+
+```
+
+---
+
+## internal/hierarchy
+
+Role, group and resource membership DAGs with transitive closure.
+
+```go
+package hierarchy // import "github.com/suga/tessaraop/internal/hierarchy"
+
+Package hierarchy resolves transitive membership over a directed acyclic graph:
+role inheritance, group nesting, and resource containment.
+
+# Why this is not part of the engine
+
+It would be natural to add a "role inherits" operator that walked a graph
+during evaluation. That is the wrong place for it, for the same reason package
+ingest does no I/O: the evaluation path is allocation-free and measured in
+microseconds, and a traversal inside it would be neither.
+
+So the closure is computed here, once, and handed to the engine as an ordinary
+attribute. A principal with role "admin" arrives carrying subject.roles =
+"admin,editor,viewer", and an existing indexed operator (has_any) answers the
+question. The engine needs no new concept, the index still prunes, and the hot
+path is untouched.
+
+# Why it is a DAG and not a tree
+
+Real role models are not trees. "on-call engineer" inherits from both "engineer"
+and "incident responder"; a resource belongs to a folder and a project. Multiple
+parents are the normal case, so this is a DAG, and the closure of a node is the
+union over all its ancestors.
+
+# Immutable after Freeze
+
+Freeze detects cycles and precomputes every closure, so a request-time lookup
+is one map read. That mirrors how index shards work: pay at build time, read at
+request time. A Graph must not be mutated after Freeze, and Add reports an error
+if it is.
+
+VARIABLES
+
+var ErrCycle = errors.New("hierarchy: cycle")
+    ErrCycle is returned by Freeze when the graph is not acyclic.
+
+
+FUNCTIONS
+
+func Join(elems []string) string
+    Join renders elements in the delimited form the engine's set operators read.
+
+
+TYPES
+
+type Graph struct {
+	// Has unexported fields.
+}
+    Graph is a membership DAG: each node names its immediate parents.
+
+    "Parent" means "is subsumed by". If admin inherits editor's permissions,
+    admin is the child and editor is the parent, and the closure of admin
+    contains editor. Getting this direction backwards is the easiest mistake to
+    make here, so the tests state it explicitly.
+
+func FromMap(m map[string][]string) (*Graph, error)
+    FromMap builds and freezes a graph from a child -> parents mapping, which is
+    the shape a bundle or a configuration file naturally carries.
+
+func New() *Graph
+    New returns an empty, unfrozen graph.
+
+func (g *Graph) Add(child string, parents ...string) *Graph
+    Add records that child is subsumed by each of parents. It may be called
+    repeatedly for the same child; parents accumulate.
+
+    Adding after Freeze is a programming error rather than a runtime condition,
+    so it panics: a graph that changed under a running engine would silently
+    produce closures inconsistent with the ones already computed.
+
+func (g *Graph) Closure(node string) []string
+    Closure returns the node together with all of its transitive parents,
+    sorted.
+
+    An unknown node yields just itself. That is deliberate: a principal carrying
+    a role the graph has never heard of should still match policies naming that
+    role exactly, rather than vanishing. The alternative — dropping it — would
+    silently narrow access on a typo in the graph rather than in the policy.
+
+    The returned slice is shared and must not be modified.
+
+func (g *Graph) ClosureOf(nodes ...string) []string
+    ClosureOf returns the union of the closures of several nodes, sorted and
+    deduplicated.
+
+func (g *Graph) Expand(value string) string
+    Expand returns the closure of a delimited multi-valued attribute value,
+    in the same delimited form. This is the shape the engine consumes: pass the
+    result straight to a subject.roles or subject.groups attribute and match it
+    with has_any / has_all / has_none.
+
+func (g *Graph) Freeze() error
+    Freeze validates the graph and precomputes every node's closure.
+
+    A cycle is an error rather than something to tolerate. Left in,
+    it would make closure computation non-terminating; "handled" by cutting the
+    traversal, it would make the closure depend on which node you started from,
+    so two principals with the same roles could get different answers.
+    Neither is acceptable in an authorization path, and a cycle in a role model
+    is always an authoring mistake.
+
+func (g *Graph) Frozen() bool
+    Frozen reports whether Freeze has run successfully.
+
+func (g *Graph) Nodes() []string
+    Nodes returns every node, sorted.
+
+func (g *Graph) Parents(node string) []string
+    Parents returns a node's immediate parents, sorted. The returned slice is a
+    copy and is safe to modify.
+
+func (g *Graph) Roots() []string
+    Roots returns nodes with no parents — the top of the hierarchy. Useful for
+    rendering a role model and for spotting an accidentally orphaned role.
+
+func (g *Graph) Size() int
+    Size reports how many distinct nodes the graph holds.
+
+func (g *Graph) Subsumes(node, ancestor string) bool
+    Subsumes reports whether node inherits from ancestor, directly or
+    transitively. A node subsumes itself.
+
+```
+
+---
+
+## internal/relation
+
+ReBAC resolver interface and in-memory implementation.
+
+```go
+package relation // import "github.com/suga/tessaraop/internal/relation"
+
+Package relation resolves what a subject is to an object, so relationship-based
+policy can be expressed without the engine growing a graph database.
+
+# The decision this package encodes
+
+ReBAC — "Anne can view this document because she is in the group that owns
+the parent folder" — is the largest functional gap against Cedar and OpenFGA.
+There were two ways to close it, and COMPARISON.md §7.1 records why this one was
+chosen.
+
+Building a Zanzibar-style tuple store natively would mean adding a database:
+durability, migrations, replication, snapshot consistency. That turns TessaraOP
+from a stateless drop-in compute component into a stateful service, with a
+different operational burden and the loss of the zero-dependency property the
+moment a driver is added. It would also mean competing on OpenFGA's strongest
+axis while the actual differentiator stagnated.
+
+So relationships are *consumed*, not stored. A Resolver answers "what is this
+subject to this object", the answer is materialized into an ordinary attribute
+before evaluation, and an indexed operator (has_any) matches it. The engine
+gains no new concept and the evaluation path is untouched — the same division of
+labour that keeps parsing and I/O outside the hot path.
+
+# Why the interface is defined here rather than importing a client
+
+Defining it natively means TessaraOP is not coupled to any one store. An adapter
+for OpenFGA, SpiceDB or an in-house service is an implementation of one method,
+and a native tuple store later would be a drop-in third implementation rather
+than a rewrite. That hedge costs almost nothing now and preserves the option.
+
+# What this handles, and what it does not
+
+This serves Check-shaped questions: "what is Anne to document:123", asked about
+one named object. That is what an authorization decision needs.
+
+It does not serve ListObjects — "which documents can Anne view" — which is a
+reverse query over the relationship graph and a genuinely different problem.
+If you need it, ask your ReBAC store directly; this package is not a substitute
+for one.
+
+CONSTANTS
+
+const SubjectRelations = "subject.relations"
+    SubjectRelations is the attribute Materialize's output belongs in. Match it
+    with has_any / has_all / has_none.
+
+
+VARIABLES
+
+var ErrResolverTimeout = errors.New("relation: resolver timed out")
+    ErrResolverTimeout is returned when a resolver exceeds its deadline.
+
+
+FUNCTIONS
+
+func Apply(ctx context.Context, r Resolver, req *model.Request, subject, object string) error
+    Apply resolves the subject's relations to the object and writes them into a
+    request's attribute map, ready for evaluation.
+
+    It is a convenience over Materialize for callers assembling a request by
+    hand rather than through package ingest.
+
+func Materialize(ctx context.Context, r Resolver, subject, object string) (string, error)
+    Materialize resolves the relations and renders them in the delimited form
+    the engine's set operators read.
+
+    This is the whole integration surface: call it while building a request, put
+    the result in subject.relations, and write policy against `subject.relations
+    has_any ["owner", "editor"]`.
+
+
+TYPES
+
+type Cache struct {
+	// Has unexported fields.
+}
+    Cache memoizes resolutions for a bounded time.
+
+    Relationship data changes, and a cached answer is a stale authorization
+    decision — so the TTL is required rather than optional, and there is no
+    invalidation hook. If your relationships change in ways that must take
+    effect immediately, do not cache them here; cache them where the writes are,
+    so an invalidation can accompany them.
+
+func NewCache(inner Resolver, ttl time.Duration) *Cache
+    NewCache wraps a resolver with a time-bounded cache.
+
+func (c *Cache) Len() int
+    Len reports how many entries are held, expired or not.
+
+func (c *Cache) Relations(ctx context.Context, subject, object string) ([]string, error)
+    Relations implements Resolver.
+
+type Chain []Resolver
+    Chain queries several resolvers and unions their answers.
+
+    The common shape is a Static holding locally-known relationships in front of
+    a remote store, so an outage in the remote one degrades to the local subset
+    rather than to no relationships at all.
+
+func (c Chain) Relations(ctx context.Context, subject, object string) ([]string, error)
+    Relations implements Resolver. An error from any member fails the whole
+    chain: silently returning a partial relation set would narrow access without
+    saying so, which in an authorization path is an outage disguised as a
+    decision.
+
+type Resolver interface {
+	// Relations returns the relation names the subject holds to the object, in
+	// any order. An empty result is not an error: it means no relationship,
+	// which is a perfectly ordinary answer.
+	Relations(ctx context.Context, subject, object string) ([]string, error)
+}
+    Resolver answers what relations a subject holds to an object.
+
+    Implementations are called once per request, before evaluation, from
+    whatever goroutine is assembling the request — never from the evaluation
+    path. They may block and may perform I/O; the context carries the caller's
+    deadline.
+
+    An implementation must be safe for concurrent use.
+
+func WithTimeout(r Resolver, d time.Duration) Resolver
+    WithTimeout bounds how long a resolver may take.
+
+    A remote relationship store sits in the request path, so an unbounded call
+    there is an availability risk for everything behind it. This does not decide
+    what to do on timeout — that is a policy question, and the caller answers
+    it by choosing whether to fail the request or to proceed with no relations,
+    which fails closed at the engine.
+
+type ResolverFunc func(ctx context.Context, subject, object string) ([]string, error)
+    ResolverFunc adapts a function to the Resolver interface.
+
+func (f ResolverFunc) Relations(ctx context.Context, subject, object string) ([]string, error)
+    Relations implements Resolver.
+
+type Static struct {
+	// Has unexported fields.
+}
+    Static is an in-memory Resolver over a fixed set of tuples.
+
+    It is not a substitute for a real ReBAC store — there is no persistence,
+    no consistency model, and no reverse index. It exists for three things
+    a product needs anyway: tests, local development, and deployments whose
+    relationship set is genuinely small and static (a handful of service
+    accounts and owners), where running a separate store would be absurd.
+
+    Two expansions are applied, and together they cover most of what a real
+    ReBAC model is asked for:
+
+      - **Object containment.** With a resource hierarchy, a relation held on a
+        folder is also held on everything inside it. This is what makes "Anne
+        can view the doc because she can view its folder" work.
+      - **Subject groups.** With a group hierarchy, a relation held by a group
+        is also held by its members, transitively.
+
+    What it deliberately does not implement is Zanzibar's full userset rewrite
+    algebra — computed usersets, tuple-to-userset indirection. Those need a real
+    engine, and pretending otherwise would be the dishonest half-implementation
+    this package's documentation warns against.
+
+func NewStatic() *Static
+    NewStatic returns an empty in-memory resolver.
+
+func (s *Static) Add(tuples ...Tuple) *Static
+    Add records a relationship. Safe to call concurrently with reads.
+
+func (s *Static) Relations(_ context.Context, subject, object string) ([]string, error)
+    Relations implements Resolver.
+
+func (s *Static) Size() int
+    Size reports how many (subject, object) pairs hold at least one relation.
+
+func (s *Static) WithGroupHierarchy(g *hierarchy.Graph) *Static
+    WithGroupHierarchy makes a relation held by a group also hold for its
+    members, transitively. The graph must be frozen, and its edges run member ->
+    group.
+
+func (s *Static) WithObjectHierarchy(g *hierarchy.Graph) *Static
+    WithObjectHierarchy makes a relation held on a container also hold on
+    everything it contains. The graph must be frozen.
+
+type Tuple struct {
+	Subject  string
+	Relation string
+	Object   string
+}
+    Tuple is one relationship fact: subject holds relation on object.
+
+```
+
+---
+
 ## internal/bundle
 
 The declarative JSON policy format and its linter.
@@ -1544,7 +2569,7 @@ convert at build time; the format below is a direct structural match either way.
                 {"attr": "subject.role", "op": "eq", "values": ["admin"]},
                 {"attr": "subject.role", "op": "eq", "values": ["security-admin"]}
               ]},
-              {"not": {"attr": "subject.groups", "op": "contains", "values": ["contractor"]}},
+              {"not": {"attr": "subject.groups", "op": "has_any", "values": ["contractor"]}},
               {"attr": "subject.risk_score", "op": "range", "min": 0, "max": 30},
               {"attr": "network.source_ip", "op": "cidr", "prefixes": ["10.0.0.0/8"]}
             ]
@@ -1993,6 +3018,24 @@ func (b *Builder) WithCookies(names ...string) *Builder
     it upstream and passing the result through FromSubject or session.valid,
     so the engine sees a verdict rather than the credential.
 
+func (b *Builder) WithGroupHierarchy(g *hierarchy.Graph) *Builder
+    WithGroupHierarchy does the same for nested group membership.
+
+func (b *Builder) WithResourceHierarchy(g *hierarchy.Graph) *Builder
+    WithResourceHierarchy expands a resource into its containment ancestors,
+    so a policy scoped to a folder or project matches everything beneath it.
+
+func (b *Builder) WithRoleHierarchy(g *hierarchy.Graph) *Builder
+    WithRoleHierarchy expands a principal's roles into their transitive closure.
+
+    A subject holding "admin" in a graph where admin inherits editor inherits
+    viewer arrives at the engine carrying subject.roles = "admin,editor,viewer",
+    so a policy written against `subject.roles has_any ["viewer"]` matches
+    without knowing the role model.
+
+    The graph must be frozen; an unfrozen one is ignored rather than silently
+    producing partial closures.
+
 type SubjectInfo struct {
 	ID            string
 	Type          string
@@ -2098,6 +3141,12 @@ type Config struct {
 	// cache entirely, which is what the benchmarks use when measuring raw
 	// index performance rather than traffic locality.
 	CacheSize int
+
+	// UnionObligations collects obligations from every matching rule carrying the
+	// winning effect, rather than only from the one credited. It removes the
+	// attribution caveat at the cost of short-circuiting — see
+	// model.Accumulator.UnionObligations.
+	UnionObligations bool
 }
     Config controls engine construction.
 
@@ -2686,6 +3735,10 @@ TYPES
 type Evaluator struct {
 	Policies  []model.Policy
 	Algorithm model.Algorithm
+
+	// UnionObligations mirrors the engine setting, so the oracle and the fast
+	// path answer the same question when it is enabled.
+	UnionObligations bool
 }
     Evaluator scans the full policy slice on every call.
 
@@ -2730,6 +3783,9 @@ TYPES
 
 type Evaluator struct {
 	Algorithm model.Algorithm
+
+	// UnionObligations mirrors the engine setting.
+	UnionObligations bool
 	// Has unexported fields.
 }
     Evaluator indexes one flat policy set with no tenant partitioning.

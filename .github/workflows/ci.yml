@@ -1,0 +1,85 @@
+# CI for TessaraOP.
+#
+# The module has no external dependencies, so there is nothing to download and
+# nothing to cache. That keeps this file short and the build reproducible.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: gofmt
+        # A formatting difference is a real failure: the repo is uniformly
+        # gofmt-clean, so a diff means somebody's editor is not.
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal ./pkg)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test with race detector
+        # -race is not optional here. The engine's central claim is that one
+        # instance serves many request goroutines: shards immutable after
+        # construction, scratch buffers pooled per goroutine, cache stripes
+        # locked. A data race in any of those is a wrong authorization decision,
+        # so the detector is the check that matters most.
+        run: go test ./... -race -count=1
+
+      - name: verify the starter bundle still lints
+        # The bundle is generated from the demo policy set, so a change to those
+        # policies that breaks the linter would otherwise only surface when
+        # somebody tried to start the server.
+        run: go run ./cmd/tessaraop -lint examples/starter-bundle.json
+
+      - name: verify the documented attribute count
+        # README and DOCUMENTATION quote the registry size. It has drifted before,
+        # so it is checked rather than trusted.
+        run: |
+          claimed=$(grep -oE '^[0-9]+ registered attributes' README.md | grep -oE '^[0-9]+')
+          actual=$(go run ./cmd/tessaraop -attrs | head -1 | grep -oE '[0-9]+ named attributes' | grep -oE '^[0-9]+')
+          echo "README claims $claimed, registry holds $actual"
+          if [ "$claimed" != "$actual" ]; then
+            echo "::error::README claims $claimed registered attributes but the registry holds $actual"
+            exit 1
+          fi
+
+  benchmarks:
+    name: benchmarks compile and run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: smoke-run the benchmarks
+        # A very short benchtime, and only the smaller corpora. The point is to
+        # catch a benchmark that no longer compiles or panics, not to produce
+        # numbers -- CI runners are too noisy for figures anyone should quote.
+        run: |
+          go test ./internal/benchmark/ -run XXX_NONE \
+            -bench 'Engine/N=10000|IndexedFlat/N=10000|NaiveSharded/N=10000' \
+            -benchtime 10x -benchmem

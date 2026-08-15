@@ -324,23 +324,35 @@ Each is checkable in this repository.
 
 This table is the spine of the document.
 
+**Closed since this assessment was first written** — phases 1 to 4 of §7 shipped:
+
+| Was | Now |
+|---|---|
+| No ReBAC / entity hierarchy (**Critical**) | Resolver interface + in-memory implementation with object containment and group expansion; adapters are the integrator's to write (§7.1) |
+| No RBAC role hierarchy (**High**) | `internal/hierarchy`: transitive closure, cycle detection, resolved at ingest |
+| No explain / decision trace (**High**) | `PDP.Explain`, `POST /v1/explain`, CLI; differentially tested against `Evaluate` |
+| No decision-log sink (Medium) | `pkg/tessaraop/audit`: structured, generation-tagged, allowlisted values, non-blocking |
+| 4 of 8 XACML algorithms missing (Low) | 6 of 8; the `ordered-` variants are deliberately excluded |
+
+Closing the role-hierarchy gap surfaced a real bug class in the process:
+expanding a closure into a comma-joined attribute and matching it with `contains`
+is a substring test, so a principal holding only `readwrite` satisfies
+`contains "read"`. The `has_any` / `has_all` / `has_none` operators compare whole
+elements, and the linter now rejects `contains` on any registered set attribute.
+
+**Remaining gaps:**
+
 | Gap | Severity | Who has it |
 |---|---|---|
-| **No ReBAC / entity hierarchy** | **Critical** | Cedar, OpenFGA, SpiceDB, Casbin |
-| **No RBAC role hierarchy** — `subject.role` is flat, no inheritance | **High** | everyone |
-| **No explain / decision trace** | **High** | Cedar, OPA |
 | No policy analysis (subsumption, conflict, reachability) | Medium | Cedar |
-| No decision-log sink, delta bundles, discovery API | Medium | OPA |
+| No delta bundles or discovery API | Medium | OPA |
 | No entity type schema | Medium | Cedar |
-| 4 of 8 XACML algorithms missing | Low | Casbin partially |
+| No `ListObjects` over relationships | Medium | OpenFGA, SpiceDB |
+| No importers from other policy formats | Medium | — |
 
-**The ReBAC gap is the one that loses deals.** Modern application authorization is
-overwhelmingly *"can Anne view this document because she is in the group that owns
-the parent folder"* — and that is currently inexpressible.
-
-**The role-hierarchy gap is cheap to close and embarrassing to leave open.**
-`subject.role == "admin"` with no notion that admin subsumes editor subsumes
-viewer is below what every competitor offers.
+`ListObjects` — *"which documents can Anne view"* — is a reverse query over the
+relationship graph rather than a predicate evaluation, and is explicitly out of
+scope for the resolver design: ask your ReBAC store directly.
 
 ---
 
@@ -367,13 +379,21 @@ axis instead of TessaraOP's own.
 
 ## 7. Roadmap implications
 
-| Phase | Work | Gap closed |
-|---|---|---|
-| **1** | Role/group hierarchy with transitive closure, resolved at ingest | RBAC hierarchy (High) |
-| **2** | `Explain` — non-short-circuiting, built on `internal/naive`, differentially tested against `Evaluate`, with attribute redaction | Cedar + OPA parity; unblocks every POC |
-| **3** | The 4 missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat |
-| **4** | ReBAC **resolver interface** + OpenFGA / SpiceDB adapters | Critical gap, without becoming stateful |
-| **5** | BDD/MTBDD compilation → subsumption, conflict, reachability | Cedar's moat |
+| Phase | Work | Gap closed | Status |
+|---|---|---|---|
+| **1** | Role/group hierarchy with transitive closure, resolved at ingest | RBAC hierarchy (High) | **Done** |
+| **2** | `Explain` — non-short-circuiting, built on the naive path, differentially tested against `Evaluate`, with attribute redaction | Cedar + OPA parity; unblocks every POC | **Done** |
+| **3** | The missing XACML algorithms + obligation union semantics | Procurement conformance; removes the non-canonical-attribution caveat | **Done** (6 of 8) |
+| **4** | ReBAC **resolver interface** + adapters | Critical gap, without becoming stateful | **Interface done**; adapters not written |
+| **5** | BDD/MTBDD compilation → subsumption, conflict, reachability | Cedar's moat | Not started |
+| **6** | Importers from other policy formats | Migration | Not started |
+
+Phase 4 shipped the interface, the in-memory implementation, composition
+(chaining, timeouts, TTL caching) and the adapter contract. **OpenFGA and SpiceDB
+adapters are not included**, and that is deliberate rather than an oversight: both
+need a live server to verify against, and shipping unexercised network code as a
+"supported adapter" is exactly the kind of claim §8 forbids. The contract is
+documented in `internal/relation` and an adapter is one method.
 
 ### 7.1 The ReBAC decision, recorded
 
@@ -419,12 +439,15 @@ conversation.
 
 - **Any competitor performance figure.** None were measured. Not "faster than
   OPA", not "faster than Cedar" — there is no benchmark behind either statement.
-- **XACML conformance.** Until Phase 3, the accurate phrasing is *"implements
-  three of the eight standard XACML 3.0 combining algorithms."*
-- **ReBAC support**, in any form, before Phase 4.
-- **RBAC support** without qualification before Phase 1. Today it is *flat* roles
-  — no hierarchy, no inheritance.
-- **Explainability.** There is no trace facility.
+- **Full XACML conformance.** The accurate phrasing is *"implements six of the
+  eight standard XACML 3.0 combining algorithms — every order-independent one."*
+  The `ordered-` variants are excluded by design, not pending.
+- **A ReBAC store.** TessaraOP *consumes* relationships through a resolver; it
+  does not store tuples, and it cannot answer `ListObjects`. The honest phrasing
+  is "integrates with your ReBAC store", never "replaces it".
+- **Shipped OpenFGA or SpiceDB adapters.** The interface and contract exist; the
+  adapters do not, because they cannot be verified without a live server.
+- **Policy analysis.** No subsumption, conflict or reachability detection.
 - The five performance figures marked *not re-measured* in `README.md` and
   `DOCUMENTATION.md` §19 — the 1M sharded row, cache-hit latency, multi-core
   throughput, whale-shard tail latency, and index build cost. The
@@ -433,9 +456,12 @@ conversation.
 **Do state, because they are true and verified:**
 
 - 4.1 µs against 100k policies, sharded, zero allocations per request.
-- 316 tests passing under `-race`.
+- All tests passing under `-race`, including a differential against a naive
+  oracle across every combining algorithm.
 - Zero external dependencies.
-- 117 registered attributes, 28 operators, 3 combining algorithms at two tiers.
+- 118 registered attributes, 31 operators, 6 combining algorithms at two tiers.
+- ACL, RBAC (with hierarchy), ABAC and ReBAC (via a resolver) are all
+  expressible.
 - **The flat-shard limitation.** At 100k policies in a single unsharded shard the
   index is ~2.1x *slower* than a short-circuiting linear scan. This is already
   disclosed in `README.md` and `DOCUMENTATION.md` §20 and **must not quietly
@@ -456,6 +482,8 @@ grep -riE "func .*Explain|Explanation" internal/ pkg/ --include=*.go
 grep -riE "entity|relationship|tuple" internal/ pkg/ --include=*.go
 ```
 
-An earlier draft of `README.md` and `DOCUMENTATION.md` claimed 118 registered
-attributes; the registry holds 117. That was caught by running the first command
-above rather than trusting the prose, which is the point of keeping this section.
+These commands exist because the prose has drifted twice. An early draft claimed
+118 attributes when the registry held 117; a later change added one and the docs
+still said 117. Both were caught by running the command rather than trusting the
+text, which is the point of keeping this section — the counts move whenever the
+registry does, so they must be checked, not remembered.

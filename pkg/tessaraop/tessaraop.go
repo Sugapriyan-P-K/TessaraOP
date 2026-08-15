@@ -41,6 +41,7 @@
 package tessaraop
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/suga/tessaraop/internal/attr"
 	"github.com/suga/tessaraop/internal/bundle"
@@ -55,6 +57,7 @@ import (
 	"github.com/suga/tessaraop/internal/explain"
 	"github.com/suga/tessaraop/internal/hierarchy"
 	"github.com/suga/tessaraop/internal/model"
+	"github.com/suga/tessaraop/internal/relation"
 )
 
 // Core types, re-exported as aliases so callers never import internal packages
@@ -654,6 +657,61 @@ func HierarchyFromMap(m map[string][]string) (*Hierarchy, error) {
 // is always an authoring mistake, and tolerating one would make a principal's
 // effective roles depend on traversal order.
 var ErrHierarchyCycle = hierarchy.ErrCycle
+
+// --- Relationships (ReBAC) --------------------------------------------------
+
+// RelationResolver answers what relations a subject holds to an object.
+//
+// Relationships are *consumed*, not stored: TessaraOP does not implement a
+// Zanzibar-style tuple store, because that would require a database and turn a
+// stateless drop-in component into a stateful service. Instead a resolver is
+// called once per request, before evaluation, and the answer is materialized
+// into subject.relations where an indexed operator (OpHasAny) matches it.
+//
+// Implement this against OpenFGA, SpiceDB or your own service. See package
+// relation for the adapter contract and for the in-memory implementation used in
+// tests and small deployments.
+type RelationResolver = relation.Resolver
+
+// RelationTuple is one relationship fact.
+type RelationTuple = relation.Tuple
+
+// AttrSubjectRelations is where ResolveRelations puts its answer. Match it with
+// OpHasAny / OpHasAll / OpHasNone.
+const AttrSubjectRelations = relation.SubjectRelations
+
+// NewStaticRelations returns an in-memory relationship resolver.
+//
+// It is not a substitute for a real ReBAC store — no persistence, no consistency
+// model, no reverse index — but it covers tests, local development, and
+// deployments whose relationship set is genuinely small and static.
+func NewStaticRelations(tuples ...RelationTuple) *relation.Static {
+	return relation.NewStatic().Add(tuples...)
+}
+
+// ResolveRelations resolves the subject's relations to the object and writes them
+// into the request, ready for evaluation.
+//
+// Call it while assembling a request, never on a hot loop: a resolver may perform
+// I/O. Wrap a remote one in RelationTimeout.
+func ResolveRelations(ctx context.Context, r RelationResolver, req *Request, subject, object string) error {
+	return relation.Apply(ctx, r, req, subject, object)
+}
+
+// RelationTimeout bounds how long a resolver may take. A remote relationship
+// store sits in the request path, so an unbounded call there is an availability
+// risk for everything behind it.
+func RelationTimeout(r RelationResolver, d time.Duration) RelationResolver {
+	return relation.WithTimeout(r, d)
+}
+
+// RelationCache memoizes resolutions for a bounded time. A cached relationship is
+// a stale authorization decision, so the TTL is required and there is no
+// invalidation hook — if your relationships must take effect immediately, cache
+// them where the writes are instead.
+func RelationCache(r RelationResolver, ttl time.Duration) RelationResolver {
+	return relation.NewCache(r, ttl)
+}
 
 // Header returns the attribute name for an HTTP request header.
 func Header(name string) string { return attr.Header(name) }

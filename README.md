@@ -232,6 +232,7 @@ tessaraopd -bundle policies.json -addr :8181 -trusted-proxy-hops 1
 | Endpoint | For |
 |---|---|
 | `POST /v1/decision` | Native JSON: full request in, full decision out |
+| `POST /v1/explain` | **Why** a decision came out as it did, per condition |
 | `ANY /v1/authz` | **Envoy ext_authz (HTTP), NGINX `auth_request`, Traefik ForwardAuth, HAProxy, Istio, Caddy `forward_auth`** — one handler, no protobuf |
 | `POST /v1/data/tessaraop` | OPA-shaped envelope, so migrating an existing OPA client is a URL change |
 | `GET /v1/attributes` | The attribute registry, as onboarding documentation |
@@ -248,7 +249,75 @@ accident. Anything unparsable is a 403 with the reason in a header.
 behaviour: a live process holding no policy denies every request, so it must be
 pulled from the load balancer, not restarted.
 
-### 4. Ingestion adapters — `internal/ingest`
+### 4. Explain — answering "why was this denied?"
+
+The question every onboarding runs into. Without an answer, each one becomes a
+support ticket where somebody reads the bundle by hand.
+
+```go
+ex := pdp.Explain(req, tessaraop.DefaultExplainOptions())
+fmt.Println(ex.Summary)
+for _, a := range ex.UnmatchedAttributes() {
+    fmt.Printf("%s failed %d times (%d because it was never supplied)\n",
+        a.Attribute, a.Failures, a.Absent)
+}
+```
+
+```
+DENIED by default: 4 policies were in scope and 8 rules evaluated, but none matched
+action           failed 3 times (3 because it was never supplied)
+subject.role     failed 3 times (0 because it was never supplied)
+```
+
+That distinction is the whole value: `action` is an **integration bug** — nobody
+is sending it — while `subject.role` is the **policy working as intended**.
+
+It is a deliberately slower second path. `Evaluate` is allocation-free and runs
+in microseconds; threading a trace through it would cost that on every request to
+serve the rare one where somebody is asking a question. So `Explain` bypasses the
+index, evaluates every in-scope rule, and short-circuits nowhere — an author wants
+every failing condition, not the first one checked. A differential test asserts
+it agrees with `Evaluate` across all six algorithms, because an explanation that
+contradicts the decision would be believed.
+
+Attribute values are **redacted by default**, since a trace usually travels
+somewhere less trusted than the evaluator.
+
+### 5. Roles, groups and relationships
+
+Hierarchies are resolved *outside* the engine and handed in as attributes, so the
+index still prunes and the hot path is untouched.
+
+```go
+roles, _ := tessaraop.HierarchyFromMap(map[string][]string{
+    "admin":  {"editor"},
+    "editor": {"viewer"},
+})
+// A principal holding "admin" arrives carrying subject.roles = "admin,editor,viewer"
+req := ingest.New("acme", "identity").
+    WithRoleHierarchy(roles).
+    FromSubject(&ingest.SubjectInfo{Role: "admin"}).
+    Build()
+```
+
+**ReBAC is consumed, not stored.** A `RelationResolver` answers "what is this
+subject to this object", and the answer materializes into `subject.relations`.
+Implement it against OpenFGA, SpiceDB or your own service; a tested in-memory
+implementation ships for tests and small deployments, with object-containment and
+group expansion. Building a native tuple store would mean adding a database and
+turning a stateless component into a stateful service — `COMPARISON.md` §7.1 has
+the reasoning.
+
+### 6. Decision audit — `pkg/tessaraop/audit`
+
+Structured records with the policy generation attached, so a decision can be tied
+back to exactly what was installed six months later. **Attribute values are not
+logged unless allowlisted** — audit logs are retained for years and shipped
+outside the trust boundary of the service that wrote them. Writes go through a
+bounded buffer: if the sink stalls, records drop and the drop is counted, because
+a decision that cannot be logged must still be *made*.
+
+### 7. Ingestion adapters — `internal/ingest`
 
 Builds a request from `*http.Request`, `net.Conn`, `*tls.ConnectionState` and your
 own token/subject verdicts, using only standard-library parsers. Parser-differential
@@ -283,7 +352,7 @@ Three security properties are enforced rather than merely documented:
 
 ## What a policy can match on
 
-117 registered attributes across the full Layer 3 / 4 / 7 surface, each with a
+118 registered attributes across the full Layer 3 / 4 / 7 surface, each with a
 declared type and the operators valid on it. Run `tessaraop -attrs` for the
 complete list, or `GET /v1/attributes` for JSON.
 
@@ -302,12 +371,18 @@ complete list, or `GET /v1/attributes` for JSON.
 Four namespaces are open-ended, because their keys belong to your traffic:
 `http.header.*`, `http.query.*`, `http.cookie.*`, `subject.claim.*`.
 
-**28 operators.** String: `eq ne in nin contains ncontains prefix nprefix suffix
-nsuffix regex nregex dnssuffix ndnssuffix`. Numeric: `range nrange gt gte lt lte
-num_eq num_ne num_in num_nin`. Network: `cidr ncidr`. Presence: `exists nexists`.
-Combined with `AND` / `OR` / `NOT`.
+**31 operators.** String: `eq ne in nin contains ncontains prefix nprefix suffix
+nsuffix regex nregex dnssuffix ndnssuffix`. Sets: `has_any has_all has_none`.
+Numeric: `range nrange gt gte lt lte num_eq num_ne num_in num_nin`. Network:
+`cidr ncidr`. Presence: `exists nexists`. Combined with `AND` / `OR` / `NOT`.
 
-Three deliberate distinctions:
+Four deliberate distinctions:
+
+- **`has_any` vs `contains`** on a multi-valued attribute. `contains` is a
+  substring test, so a principal holding only `readwrite` satisfies
+  `subject.roles contains "read"` — a privilege escalation. The `has_*` operators
+  split on the delimiter and compare whole elements. The linter rejects
+  `contains` on any attribute the registry documents as a set.
 
 - **`suffix` vs `dnssuffix`.** `suffix` is a raw byte test, for file extensions.
   `dnssuffix` is label-aligned, because accepting `evilacme.com` for `acme.com` is
@@ -367,9 +442,12 @@ union of what all its rules ask for, which is useless as a filter. Positions are
 assigned in policy order, so ascending candidate positions form one contiguous run
 per policy and the two-tier walk groups them with no map and no allocation.
 
-Three combining algorithms, used at both tiers: `deny-overrides` (default,
-order-independent, the only one that short-circuits), `permit-overrides`, and
-`first-applicable` (priority then ID, fully deterministic).
+Six combining algorithms, used at both tiers — the order-independent subset of
+XACML 3.0's eight. `deny-overrides` (default, the only one that short-circuits),
+`permit-overrides`, `first-applicable`, `deny-unless-permit`,
+`permit-unless-deny` and `only-one-applicable`. The `ordered-` variants are
+deliberately absent: they resolve ties by document order, and the index yields
+candidates in arbitrary order, so honouring them would forfeit short-circuiting.
 
 Deny-overrides being **order-independent** is what makes indexing sound: the index
 yields candidates in whatever order the underlying sets enumerate, and that

@@ -33,7 +33,10 @@ No external dependencies. No `go.sum`. Go 1.26.5.
 ```
 internal/
 ├── model/     types, operator semantics, condition trees, both combining tiers
-├── attr/      117-attribute L3/L4/L7 registry with type + operator validation
+├── attr/      118-attribute L3/L4/L7 registry with type + operator validation
+├── hierarchy/ role/group/resource DAG: closure, cycle detection, frozen
+├── explain/   per-condition "why?", built on the naive path
+├── relation/  ReBAC resolver interface + in-memory implementation
 ├── bitset/    hybrid sparse/dense integer sets
 ├── matcher/   CIDR trie, domain trie, prefix/suffix tables, interval, numeric set
 ├── index/     sub-indexes over flattened rules, two intersection strategies
@@ -61,7 +64,7 @@ Policy (ID, TenantID, Scope, Priority, RuleAlgorithm)
         └─ When: ConditionExpr — And / Or / Not / leaf Condition
 ```
 
-**28 operators** across four families. String: `eq ne in nin contains ncontains
+**31 operators** across four families. String: `eq ne in nin contains ncontains
 prefix nprefix suffix nsuffix regex nregex dnssuffix ndnssuffix`. Numeric:
 `range nrange gt gte lt lte num_eq num_ne num_in num_nin`. Network:
 `cidr ncidr`. Presence: `exists nexists`.
@@ -332,7 +335,7 @@ go vet ./...
 go test ./... -race                  # 316 tests (needs 64-bit gcc, see §5)
 
 go run ./cmd/tessaraop -demo         # policy walkthrough, incl. the two-tier case
-go run ./cmd/tessaraop -attrs        # the 117-attribute registry
+go run ./cmd/tessaraop -attrs        # the 118-attribute registry
 go run ./cmd/tessaraop -lint examples/starter-bundle.json
 go run ./cmd/tessaraop -n 100000 -tenants 1000 -requests 6
 go run ./cmd/tessaraopd -bundle examples/starter-bundle.json -addr :8181
